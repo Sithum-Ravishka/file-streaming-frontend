@@ -1,11 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /** =========================================================
- *  Chunk Uploader — Clean Multi-Batch UI
+ *  Chunk Uploader — Clean Multi-Batch UI (Real-time)
  *  - One clean drag area per batch
  *  - Server limits shown (via GET /limits if present, else learned from errors)
- *  - Speed + ETA, WS progress, resumable
- *  - No “chunk workers/file” control (server-side concern)
+ *  - Speed + ETA: WS first, 1s polling fallback, client PUT fallback
+ *  - Correctly flips from "queued" to "uploading" if server already received bytes
+ *  - Resumable (createOrResumeBatch + /uploads/:id/status)
+ *  - Final avg speed + total time shown after completion
  * ========================================================= */
 
 type ServerSession = { id: string; wsToken?: string; partSize: number; batchId: string };
@@ -18,13 +20,17 @@ type FileItem = {
   message?: string;
   uploadId?: string;
   partSize?: number;
-  bytesSent: number;
-  partsDone: number;
-  partsTotal: number;
-  speedBps: number;
-  etaMs: number;
+  bytesSent: number;    // client-side PUT bytes (fallback)
+  partsDone: number;    // client-side PUT parts (fallback)
+  partsTotal: number;   // computed from partSize
+  speedBps: number;     // client fallback speed
+  etaMs: number;        // client fallback ETA
   createdAt: number;
   controller?: AbortController;
+  // lifecycle + final stats
+  startedAt?: number;
+  finalAvgBps?: number;
+  totalTimeMs?: number;
 };
 
 type UploaderSettings = {
@@ -289,9 +295,12 @@ export default function UploadDashboard(){
     setBatches(prev=>{ const next=[b, ...prev]; persistShells(next); return next; });
   };
 
+  // PROGRESS + SPEED (WS + client polling fallback)
   const speedRefs = useRef<Map<string,SpeedWindow>>(new Map());
+  const lastServerBytes = useRef<Map<string, { t:number; b:number }>>(new Map());
   const wsMap = useRef<Map<string,WebSocket>>(new Map());
   const serverProgress = useRef<Map<string,{percent:number;bytesReceived:number;receivedParts:number;expectedParts:number;batchId:string}>>(new Map());
+  const lastPolledAt = useRef<Map<string, number>>(new Map());
 
   useEffect(()=>{
     const iv=setInterval(()=>{
@@ -314,22 +323,123 @@ export default function UploadDashboard(){
       ws.onmessage=(ev)=>{
         try{
           const m=JSON.parse(String(ev.data));
-          if (m?.type==="progress" && m.uploadId===uploadId){
-            serverProgress.current.set(uploadId,{
-              percent:Number(m.percent)||0,
-              bytesReceived:Number(m.bytesReceived)||0,
-              receivedParts:Number(m.receivedParts)||0,
-              expectedParts:Number(m.expectedParts)||0,
-              batchId:String(m.batchId||""),
+          if (m?.type === "progress" && m.uploadId === uploadId){
+            const now = Date.now();
+            const cur = Number(m.bytesReceived) || 0;
+
+            serverProgress.current.set(uploadId, {
+              percent: Number(m.percent) || 0,
+              bytesReceived: cur,
+              receivedParts: Number(m.receivedParts) || 0,
+              expectedParts: Number(m.expectedParts) || 0,
+              batchId: String(m.batchId || ""),
             });
+
+            const sw = speedRefs.current.get(uploadId) ?? new SpeedWindow(10_000);
+            speedRefs.current.set(uploadId, sw);
+            const prev = lastServerBytes.current.get(uploadId);
+            if (prev) {
+              const delta = Math.max(0, cur - prev.b);
+              if (delta > 0) sw.push(delta);
+            }
+            lastServerBytes.current.set(uploadId, { t: now, b: cur });
+
+            // Flip states based on observed server bytes
+            setBatches(prev => prev.map(b => ({
+              ...b,
+              files: b.files.map(f => {
+                if (f.uploadId !== uploadId) return f;
+                if ((f.status === "queued" || f.status === "paused" || f.status === "error") && cur > 0 && (Number(m.percent)||0) < 100){
+                  return { ...f, status: "uploading", startedAt: f.startedAt ?? Date.now() };
+                }
+                if (f.status !== "done" && (Number(m.percent)||0) >= 100){
+                  const startedAtVal = f.startedAt ?? f.createdAt;
+                  const elapsed = Math.max(0, now - startedAtVal);
+                  const avgBps = elapsed > 0 ? (f.file.size * 1000) / elapsed : 0;
+                  return { ...f, status: "done", finalAvgBps: avgBps, totalTimeMs: elapsed, message: f.message || "Completed" };
+                }
+                return f;
+              })
+            })));
           }
-        }catch{}
+        } catch {}
       };
-      ws.onclose=()=>{ wsMap.current.delete(uploadId); };
-      ws.onerror=()=>{};
+      ws.onclose = () => { wsMap.current.delete(uploadId); };
+      ws.onerror = () => {};
       wsMap.current.set(uploadId, ws);
-    }catch{}
+    } catch {}
   }
+
+  // POLLING FALLBACK (1s): for uploads without an active WS
+  useEffect(()=>{
+    const tick = async () => {
+      const now = Date.now();
+      const toPoll: Array<{uploadId:string; file: FileItem; batchId:string}> = [];
+
+      batches.forEach(b => b.files.forEach(f => {
+        if (!f.uploadId) return;
+        const sp = serverProgress.current.get(f.uploadId);
+        const done = sp ? sp.percent >= 100 : (f.status === 'done');
+        const hasWs = wsMap.current.has(f.uploadId);
+        if (!done && !hasWs && (f.status === 'uploading' || f.status === 'queued')){
+          const last = lastPolledAt.current.get(f.uploadId) || 0;
+          if (now - last >= 1000) {
+            lastPolledAt.current.set(f.uploadId, now);
+            toPoll.push({ uploadId: f.uploadId, file: f, batchId: b.id });
+          }
+        }
+      }));
+
+      const MAX_P = 4;
+      for (let i = 0; i < toPoll.length && i < MAX_P; i++){
+        const { uploadId, file, batchId } = toPoll[i];
+        try{
+          const st = await getStatus(settings.serverUrl, settings.token, uploadId);
+          const total = Number(st?.receivedParts?.reduce?.((a:number,b:any)=>a+b.size,0) || 0);
+          const expectedParts = Number(st?.expectedParts||0);
+          const receivedParts = Number(st?.receivedParts?.length||0);
+          const percent = file.file.size > 0 ? Math.floor((total / file.file.size) * 100) : 0;
+
+          serverProgress.current.set(uploadId, {
+            percent,
+            bytesReceived: total,
+            receivedParts,
+            expectedParts,
+            batchId: String(st?.batchId || batchId),
+          });
+
+          const sw = speedRefs.current.get(uploadId) ?? new SpeedWindow(10_000);
+          speedRefs.current.set(uploadId, sw);
+          const prev = lastServerBytes.current.get(uploadId);
+          if (prev){
+            const delta = Math.max(0, total - prev.b);
+            if (delta > 0) sw.push(delta);
+          }
+          lastServerBytes.current.set(uploadId, { t: Date.now(), b: total });
+
+          setBatches(prev => prev.map(B => ({
+            ...B,
+            files: B.files.map(x => {
+              if (x.uploadId !== uploadId) return x;
+              if ((x.status === 'queued' || x.status === 'paused' || x.status === 'error') && total > 0 && percent < 100){
+                return { ...x, status: 'uploading', startedAt: x.startedAt ?? Date.now() };
+              }
+              if (x.status !== 'done' && percent >= 100){
+                const startedAtVal = x.startedAt ?? x.createdAt;
+                const elapsed = Math.max(0, Date.now() - startedAtVal);
+                const avgBps = elapsed > 0 ? (x.file.size * 1000) / elapsed : 0;
+                return { ...x, status: 'done', finalAvgBps: avgBps, totalTimeMs: elapsed, message: x.message || 'Completed' };
+              }
+              return x;
+            })
+          })));
+        }catch{}
+      }
+    };
+
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [batches, settings.serverUrl, settings.token]);
 
   const onAddFilesToBatch = (batchId:string, incoming:File[]) => {
     setBatches(prev=>prev.map(b=>{
@@ -355,7 +465,17 @@ export default function UploadDashboard(){
     const queue=batch.files.filter(f=>["queued","paused","error"].includes(f.status)).map(f=>f.key);
     if (!queue.length) return;
 
-    setBatches(prev=>prev.map(b=>b.id!==batchId?b:{...b, files:b.files.map(it=>queue.includes(it.key)?{...it,status:"uploading",controller:new AbortController(),message:""}:it)}));
+    // Optimistically mark -> uploading and set startedAt immediately
+    setBatches(prev=>prev.map(b=>b.id!==batchId?b:{...b, files:b.files.map(it=>{
+      if (!queue.includes(it.key)) return it;
+      return {
+        ...it,
+        status:"uploading",
+        controller:new AbortController(),
+        message:"",
+        startedAt: it.startedAt ?? Date.now(),
+      };
+    })}));
 
     const worker=async()=>{
       while(true){
@@ -405,49 +525,48 @@ export default function UploadDashboard(){
     const pending:number[]=[]; for(let pn=1;pn<=totalParts;pn++) if(!have.has(pn)) pending.push(pn);
     const PART_WORKERS=4;
 
-   const workers = Array.from({ length: PART_WORKERS }, async () => {
-  while (pending.length && !controller.signal.aborted) {
-    const pn = pending.shift()!;
-    await part(pn);
-  }
-});
+    const workers = Array.from({ length: PART_WORKERS }, async () => {
+      while (pending.length && !controller.signal.aborted) {
+        const pn = pending.shift()!;
+        await part(pn);
+      }
+    });
 
     function part(pn: number) {
-  return (async () => {
-    if (controller.signal.aborted) return;
-    const start = (pn - 1) * partSize!;
-    const end   = Math.min(item!.file.size, start + partSize!);
-    const blob  = item!.file.slice(start, end);
-    const len   = end - start;
+      return (async () => {
+        if (controller.signal.aborted) return;
+        const start = (pn - 1) * partSize!;
+        const end   = Math.min(item!.file.size, start + partSize!);
+        const blob  = item!.file.slice(start, end);
+        const len   = end - start;
 
-    const buf     = await blob.arrayBuffer();
-    const digest  = await sha256(buf);
-    const s256b64 = toBase64(digest);
+        const buf     = await blob.arrayBuffer();
+        const digest  = await sha256(buf);
+        const s256b64 = toBase64(digest);
 
-    const token = await withBackoff(
-      async () => await getPartToken(
-        settings.serverUrl, settings.token, uploadId!, pn, len, s256b64,
-        (p)=>mergeServerHints(setHints,p)
-      ),
-      5
-    );
+        const token = await withBackoff(
+          async () => await getPartToken(
+            settings.serverUrl, settings.token, uploadId!, pn, len, s256b64,
+            (p)=>mergeServerHints(setHints,p)
+          ),
+          5
+        );
 
-    await withBackoff(async () => {
-      await putPart(
-        settings.serverUrl, settings.token, uploadId!, pn, blob, token, s256b64,
-        controller.signal, (p)=>mergeServerHints(setHints,p)
-      );
-      partsDone += 1;
-      bytesSent += len;
-      sp.push(len);
-      const bps    = sp.bps();
-      const remain = item!.file.size - bytesSent;
-      const eta    = bps > 0 ? (remain / bps) * 1000 : NaN;
-      update({ partsDone, bytesSent, speedBps: bps, etaMs: eta });
-    }, 5);
-  })();
-}
-
+        await withBackoff(async () => {
+          await putPart(
+            settings.serverUrl, settings.token, uploadId!, pn, blob, token, s256b64,
+            controller.signal, (p)=>mergeServerHints(setHints,p)
+          );
+          partsDone += 1;
+          bytesSent += len;
+          sp.push(len);
+          const bps    = sp.bps();
+          const remain = item!.file.size - bytesSent;
+          const eta    = bps > 0 ? (remain / bps) * 1000 : NaN;
+          update({ partsDone, bytesSent, speedBps: bps, etaMs: eta });
+        }, 5);
+      })();
+    }
 
     try{
       await Promise.all(workers);
@@ -459,7 +578,12 @@ export default function UploadDashboard(){
       let finalHex: string | undefined;
       if (settings.finalizeChecksum){ const all=await item.file.arrayBuffer(); finalHex=toHex(await sha256(all)); }
       await completeUpload(settings.serverUrl, settings.token, uploadId!, finalHex);
-      update({ status:"done", message:"Completed", speedBps:0, etaMs:0, partsDone:totalParts, bytesSent:item.file.size });
+
+      const startedAtVal = item.startedAt ?? item.createdAt;
+      const elapsed = Math.max(0, Date.now() - startedAtVal);
+      const avgBps = elapsed > 0 ? (item.file.size * 1000) / elapsed : 0;
+
+      update({ status:"done", message:"Completed", speedBps:0, etaMs:0, partsDone:totalParts, bytesSent:item.file.size, finalAvgBps: avgBps, totalTimeMs: elapsed });
     }catch(e:any){
       if (controller.signal.aborted){
         const paused=batches.find(bb=>bb.id===batchId)?.files.find(x=>x.key===key)?.status==="paused";
@@ -490,7 +614,13 @@ export default function UploadDashboard(){
     setBatches(prev=>prev.map(B=>B.id!==batchId?B:{...B, files:B.files.map(x=>x.key!==key?x:(x.controller?.abort(), {...x,status:"paused",message:"Paused"}))}));
 
   const resumeFile = (batchId:string, key:FileKey)=>{
-    setBatches(prev=>prev.map(B=>B.id!==batchId?B:{...B, files:B.files.map(x=>x.key===key?{...x,status:"uploading",controller:new AbortController(),message:""}:x)}));
+    setBatches(prev=>prev.map(B=>B.id!==batchId?B:{...B, files:B.files.map(x=>x.key===key?{
+      ...x,
+      status:"uploading",
+      controller:new AbortController(),
+      message:"",
+      startedAt: x.startedAt ?? Date.now(),
+    }:x)}));
     uploadOne(batchId,key).catch(e=> setBatches(prev=>prev.map(B=>B.id!==batchId?B:{...B, files:B.files.map(x=>x.key===key?{...x,status:"error",message:String(e)}:x)})));
   };
 
@@ -588,7 +718,7 @@ export default function UploadDashboard(){
           <div className="limits">
             <div className="limits-title">
               Server limits (read-only)
-             <button
+              <button
                 className="btn ghost sm"
                 style={{ marginLeft: 8 }}
                 onClick={async () => {
@@ -660,9 +790,14 @@ export default function UploadDashboard(){
                       expectedParts: Number(st?.expectedParts||0),
                       batchId: String(st?.batchId||batch.id),
                     });
+                    const sw = speedRefs.current.get(f.uploadId) ?? new SpeedWindow(10_000);
+                    speedRefs.current.set(f.uploadId, sw);
+                    const prev = lastServerBytes.current.get(f.uploadId);
+                    if (prev){ const delta = Math.max(0, total - prev.b); if (delta>0) sw.push(delta); }
+                    lastServerBytes.current.set(f.uploadId, { t: Date.now(), b: total });
+                    setBatches(prev=>[...prev]);
                   }catch{}
                 });
-                setBatches(prev=>[...prev]);
               }}>Refresh Files</button>
             </div>
 
@@ -699,7 +834,29 @@ export default function UploadDashboard(){
                     const clientPct = fi.partsTotal ? Math.floor((fi.partsDone/fi.partsTotal)*100) : 0;
                     const displayPct = Number.isFinite(serverPct as any) ? (serverPct as number) : clientPct;
                     const partsText = sv ? `${sv.receivedParts}/${sv.expectedParts} parts` : `${fi.partsDone}/${fi.partsTotal} parts`;
-                    const bytesText = sv ? `${fmtBytes(sv.bytesReceived)} / ${fmtBytes(fi.file.size)}` : `${fmtBytes(fi.bytesSent)} / ${fmtBytes(fi.file.size)}`;
+
+                    const bytesDone = sv ? sv.bytesReceived : fi.bytesSent;
+                    const bytesText = `${fmtBytes(bytesDone)} / ${fmtBytes(fi.file.size)}`;
+
+                    // Prefer WS/poll speed; fallback to client-side speed
+                    const wsSw = fi.uploadId ? speedRefs.current.get(fi.uploadId) : undefined;
+                    const wsBps = wsSw?.bps() || 0;
+                    const currBps = wsBps > 0 ? wsBps : fi.speedBps;
+                    const remain = Math.max(0, fi.file.size - bytesDone);
+                    const currEtaMs = currBps > 0 ? (remain / currBps) * 1000 : NaN;
+
+                    let speedCell: React.ReactNode = "—";
+                    let etaCell: React.ReactNode = "—";
+                    if (displayPct < 100) {
+                      if (currBps > 0) {
+                        speedCell = `${fmtBytes(currBps)}/s`;
+                        etaCell = fmtTime(currEtaMs);
+                      }
+                    } else {
+                      const bpsToShow = fi.finalAvgBps && fi.finalAvgBps > 0 ? fi.finalAvgBps : currBps;
+                      speedCell = bpsToShow > 0 ? `${fmtBytes(bpsToShow)}/s` : '—';
+                      etaCell = fi.totalTimeMs && fi.totalTimeMs > 0 ? fmtTime(fi.totalTimeMs) : '—';
+                    }
 
                     return (
                       <div key={fi.key} className="trow">
@@ -714,8 +871,8 @@ export default function UploadDashboard(){
                           <div className="muted small">{partsText} • {bytesText}</div>
                           {fi.message && <div className={`small ${fi.status==="error"?"err":"muted"}`}>{fi.message}</div>}
                         </div>
-                        <div className="right">{fi.status==="uploading" && fi.speedBps>0 ? `${fmtBytes(fi.speedBps)}/s` : "—"}</div>
-                        <div className="right">{fi.status==="uploading" ? fmtTime(fi.etaMs) : "—"}</div>
+                        <div className="right">{speedCell}</div>
+                        <div className="right">{etaCell}</div>
                         <div className="right actions">
                           {fi.status==="queued" && <button className="btn ghost" onClick={()=>resumeFile(batch.id, fi.key)}>Start</button>}
                           {fi.status==="uploading" && (<><button className="btn ghost" onClick={()=>pauseFile(batch.id, fi.key)}>Pause</button><button className="btn ghost warn" onClick={()=>cancelFile(batch.id, fi.key)}>Cancel</button></>)}
@@ -791,7 +948,7 @@ progress{width:100%;height:10px;appearance:none;border:none;background:#1b2536;b
 progress::-webkit-progress-bar{background:transparent}
 progress::-webkit-progress-value{background:linear-gradient(90deg,var(--brand),#8ed0ff);transition:width .25s ease}
 .pct{min-width:38px;text-align:right;color:#cfe2ff}
-.empty{padding:16px;border:1px dashed var(--line);border-radius:10px;color:var(--muted);text-align:center}
+.empty{padding:16px;border:1px dashed var(--line);border-radius:10px;color:#94a3b8;text-align:center}
 .limits{margin-top:10px;padding-top:10px;border-top:1px dashed var(--line)}
 .limits-title{font-weight:800;margin-bottom:6px;display:flex;align-items:center}
 .limits-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
