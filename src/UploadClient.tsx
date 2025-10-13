@@ -1,3 +1,4 @@
+// UploadDashboard.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /** =========================================================
@@ -7,7 +8,11 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  *  - Speed + ETA: WS first, 1s polling fallback, client PUT fallback
  *  - Correctly flips from "queued" to "uploading" if server already received bytes
  *  - Resumable (createOrResumeBatch + /uploads/:id/status)
- *  - Final avg speed + total time shown after completion
+ *  - Waits for all parts on server before /complete
+ *  - Clear error surfacing (incl. /complete 400s)
+ *  - Collects DID, Doc ID, Doc Type, Doc Name, Path (no Batch Type / Job / Job ID)
+ *  - Repairs missing parts on /complete errors, then retries /complete
+ *  - NEW (fix): Cleans local resume/progress/WS artifacts on done/cancel/error/remove/clear
  * ========================================================= */
 
 type ServerSession = { id: string; wsToken?: string; partSize: number; batchId: string };
@@ -20,14 +25,13 @@ type FileItem = {
   message?: string;
   uploadId?: string;
   partSize?: number;
-  bytesSent: number;    // client-side PUT bytes (fallback)
-  partsDone: number;    // client-side PUT parts (fallback)
-  partsTotal: number;   // computed from partSize
-  speedBps: number;     // client fallback speed
-  etaMs: number;        // client fallback ETA
+  bytesSent: number;
+  partsDone: number;
+  partsTotal: number;
+  speedBps: number;
+  etaMs: number;
   createdAt: number;
   controller?: AbortController;
-  // lifecycle + final stats
   startedAt?: number;
   finalAvgBps?: number;
   totalTimeMs?: number;
@@ -47,6 +51,12 @@ type Batch = {
   createdAt: number;
   expanded: boolean;
   files: FileItem[];
+  // user-supplied batch metadata
+  did?: string;
+  docid?: string;
+  doctype?: string;
+  docname?: string;   // server may map to "dockname"
+  path?: string;
 };
 
 type ServerHints = {
@@ -59,9 +69,9 @@ type ServerHints = {
   fileSizeMax?: number;
 };
 
-const LS_SETTINGS = "chunkDash:v6:settings";
-const LS_RESUMES  = "chunkDash:v6:resumes";
-const LS_BATCHES  = "chunkDash:v6:batches";
+const LS_SETTINGS = "chunkDash:v9:settings";
+const LS_RESUMES  = "chunkDash:v9:resumes";
+const LS_BATCHES  = "chunkDash:v9:batches";
 
 const ENV_SERVER =
   (import.meta as any)?.env?.VITE_SERVER_URL ||
@@ -72,6 +82,7 @@ const ENV_TOKEN =
   (typeof process !== "undefined" ? (process as any)?.env?.VITE_UPLOAD_TOKEN : "") ||
   "";
 
+// ---------------- Utils ----------------
 const fmtBytes = (n: number) => {
   if (!Number.isFinite(n) || n <= 0) return "0 B";
   const u = ["B","KB","MB","GB","TB"];
@@ -90,7 +101,15 @@ const fmtTime = (ms: number) => {
 const keyOf = (f: File): FileKey => `${f.name}::${f.size}::${f.lastModified}`;
 
 async function sha256(buf: ArrayBuffer){ return crypto.subtle.digest("SHA-256", buf); }
-function toBase64(buf: ArrayBuffer){ return btoa(String.fromCharCode(...new Uint8Array(buf))); }
+function toBase64(buf: ArrayBuffer){
+  const bytes = new Uint8Array(buf);
+  const CHUNK = 0x8000;
+  let s = "";
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    s += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(s);
+}
 function toHex(buf: ArrayBuffer){ return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,"0")).join(""); }
 
 class SpeedWindow {
@@ -103,19 +122,34 @@ class SpeedWindow {
 }
 
 const baseUrl = (s: string) => s.replace(/\/$/, "");
+function buildFilesInputForBatch(batch: Batch){
+  return batch.files.map((f, idx) => ({
+    index: idx,
+    key: `file-${idx}`,
+    name: f.file.name,
+    contentType: f.file.type || "application/octet-stream",
+  }));
+}
 
+// ---------------- API helpers ----------------
 function mergeServerHints(setter: React.Dispatch<React.SetStateAction<ServerHints>>, payload: any){
   if (!payload || typeof payload !== "object") return;
-  setter(prev => ({
-    ...prev,
-    partSizeMin: payload.min ?? prev.partSizeMin,
-    partSizeMax: payload.max ?? prev.partSizeMax,
-    maxConcurrentFiles: payload.limit ?? prev.maxConcurrentFiles,
-    maxChunksPerUpload: payload.limit ?? prev.maxChunksPerUpload,
-    globalUploadLimit: payload.limit ?? prev.globalUploadLimit,
-    maxBytesPerMinute: payload.limitPerMinute ?? prev.maxBytesPerMinute,
-    fileSizeMax: payload.fileSizeMax ?? prev.fileSizeMax,
-  }));
+  setter(prev => {
+    const next: ServerHints = {
+      partSizeMin: payload.partSizeMin ?? prev.partSizeMin,
+      partSizeMax: payload.partSizeMax ?? prev.partSizeMax,
+      maxConcurrentFiles: payload.maxConcurrentFiles ?? prev.maxConcurrentFiles,
+      maxChunksPerUpload: payload.maxChunksPerUpload ?? prev.maxChunksPerUpload,
+      globalUploadLimit: payload.globalUploadLimit ?? prev.globalUploadLimit,
+      maxBytesPerMinute: payload.maxBytesPerMinute ?? prev.maxBytesPerMinute,
+      fileSizeMax: payload.fileSizeMax ?? prev.fileSizeMax,
+    };
+    if (Number.isFinite(payload?.min)) next.partSizeMin = payload.min;
+    if (Number.isFinite(payload?.max)) next.partSizeMax = payload.max;
+    if (Number.isFinite(payload?.limit)) next.maxChunksPerUpload ??= payload.limit;
+    if (Number.isFinite(payload?.limitPerMinute)) next.maxBytesPerMinute = payload.limitPerMinute;
+    return next;
+  });
 }
 
 async function fetchLimitsIfAny(base: string): Promise<Partial<ServerHints>>{
@@ -131,7 +165,7 @@ async function createOrResumeBatch(
   token: string,
   file: File,
   requestedPartSize: number,
-  batchId: string,
+  batch: Batch,
   resumeId: string | null,
   onHint?: (p:any)=>void
 ): Promise<ServerSession>{
@@ -142,10 +176,22 @@ async function createOrResumeBatch(
     partSize: requestedPartSize,
   }];
 
+  const body: any = {
+    batchId: batch.id,
+    files: filesPayload,
+    // user-provided metadata ONLY (server generates job/jobId/type internally)
+    did: (batch.did || "").trim() || undefined,
+    docid: (batch.docid || "").trim() || undefined,
+    doctype: (batch.doctype || "").trim() || undefined,
+    docname: (batch.docname || "").trim() || undefined,
+    path: (batch.path || "").trim() || undefined,
+    filesInput: buildFilesInputForBatch(batch),
+  };
+
   const r = await fetch(`${baseUrl(base)}/uploads/batch`, {
     method: "POST",
     headers: { "Content-Type":"application/json", Authorization:`Bearer ${token.trim()}` },
-    body: JSON.stringify({ batchId, files: filesPayload }),
+    body: JSON.stringify(body),
     credentials: "omit", mode: "cors",
   });
 
@@ -153,7 +199,9 @@ async function createOrResumeBatch(
   let j:any = {}; try{ j = JSON.parse(text||"{}"); }catch{}
   if (!r.ok || !j?.created?.length){
     onHint?.(j);
-    throw new Error(j?.error || `Batch create/resume failed (${r.status})`);
+    const err: any = new Error(j?.error || `Batch create/resume failed (${r.status})`);
+    (err.body = j);
+    throw err;
   }
   const c = j.created[0];
   return { id:c.id, wsToken:c.wsToken, partSize:c.partSize, batchId: j.batchId || c.batchId };
@@ -164,7 +212,11 @@ async function getStatus(base:string, token:string, uploadId:string){
     headers: { Authorization:`Bearer ${token.trim()}` }, credentials:"omit", mode:"cors"
   });
   const j = await r.json().catch(()=> ({}));
-  if (!r.ok) throw new Error(j?.error || `Status failed (${r.status})`);
+  if (!r.ok) {
+    const err: any = new Error(j?.error || `Status failed (${r.status})`);
+    (err.body = j);
+    throw err;
+  }
   return j;
 }
 
@@ -178,7 +230,9 @@ async function getPartToken(
   let j:any = {}; try{ j=JSON.parse(text||"{}"); }catch{}
   if (!r.ok || !j?.token){
     onHint?.(j);
-    throw new Error(j?.error || `Token p${pn} failed (${r.status})`);
+    const err: any = new Error(j?.error || `Token p${pn} failed (${r.status})`);
+    (err.body = j);
+    throw err;
   }
   return j.token as string;
 }
@@ -201,8 +255,9 @@ async function putPart(
     const text = await r.text().catch(()=> "");
     let j:any = {}; try{ j=JSON.parse(text||"{}"); }catch{}
     onHint?.(j);
-    const err = new Error(`Part ${pn} failed: ${r.status} ${j?.error || text}`) as any;
+    const err: any = new Error(`Part ${pn} failed: ${r.status} ${j?.error || text}`);
     (err.retryAfterMs = Number.isFinite(retryAfter) ? retryAfter*1000 : undefined);
+    (err.body = j);
     throw err;
   }
 }
@@ -215,7 +270,11 @@ async function completeUpload(base:string, token:string, uploadId:string, finalH
     credentials:"omit", mode:"cors"
   });
   const j = await r.json().catch(()=> ({}));
-  if (!r.ok) throw new Error(j?.error || `Complete failed (${r.status})`);
+  if (!r.ok) {
+    const err: any = new Error(j?.error || `Complete failed (${r.status})`);
+    (err.body = j);
+    throw err;
+  }
   return j;
 }
 
@@ -226,6 +285,87 @@ async function heartbeat(base:string, token:string, uploadId:string){
   await fetch(`${baseUrl(base)}/heartbeat/${uploadId}`, { method:"POST", headers:{ Authorization:`Bearer ${token.trim()}` }, credentials:"omit", mode:"cors" }).catch(()=>{});
 }
 
+// ---------- NEW: parts listing + repair helpers ----------
+async function listParts(base: string, token: string, uploadId: string) {
+  const r = await fetch(`${baseUrl(base)}/uploads/${uploadId}/parts`, {
+    headers: { Authorization: `Bearer ${token.trim()}` },
+    credentials: "omit",
+    mode: "cors",
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const err: any = new Error(j?.error || `List parts failed (${r.status})`);
+    (err.body = j);
+    throw err;
+  }
+  // returns: { uploadId, parts: [{ partNumber, size, exists, cid, ipfsStatus }, ...] }
+  return j;
+}
+
+function parseMissingPartsFromError(e: any): number[] {
+  const body = e?.body || {};
+  const err = body?.error || "";
+  if (Array.isArray(body?.missing) && body.missing.length) {
+    return body.missing.map((x: any) => Number(x)).filter((n: number) => Number.isFinite(n) && n > 0);
+  }
+  const m = /^missing_part_(\d+)$/i.exec(err);
+  if (m) return [Number(m[1])];
+  return [];
+}
+
+async function reuploadSpecificParts(opts: {
+  base: string; token: string; uploadId: string; file: File; partSize: number;
+  partNumbers: number[]; controller?: AbortSignal; onHint?: (p: any) => void;
+}) {
+  const { base, token, uploadId, file, partSize, partNumbers, controller, onHint } = opts;
+
+  async function sha256B64OfSlice(start: number, end: number) {
+    const blob = file.slice(start, end);
+    const buf = await blob.arrayBuffer();
+    const digest = await crypto.subtle.digest("SHA-256", buf);
+    const bytes = new Uint8Array(digest);
+    let s = "", CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) s += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    return { blob, b64: btoa(s), len: end - start };
+  }
+
+  for (const pn of partNumbers) {
+    const start = (pn - 1) * partSize;
+    const end = Math.min(file.size, start + partSize);
+    const { blob, b64, len } = await sha256B64OfSlice(start, end);
+
+    const tokenResp = await getPartToken(base, token, uploadId, pn, len, b64, onHint);
+    await putPart(base, token, uploadId, pn, blob, tokenResp, b64, controller, onHint);
+  }
+}
+
+async function repairThenComplete({
+  base, token, uploadId, file, partSize, finalHex, controller, onHint,
+}: {
+  base: string; token: string; uploadId: string; file: File; partSize: number;
+  finalHex?: string; controller?: AbortSignal; onHint?: (p: any) => void;
+}) {
+  // 1) ask the server which parts exist
+  const lp = await listParts(base, token, uploadId);
+  const expected = Math.ceil(file.size / partSize);
+  const missing: number[] = [];
+  for (let i = 1; i <= expected; i++) {
+    const row = lp.parts.find((p: any) => p.partNumber === i);
+    if (!row || !row.exists) missing.push(i);
+  }
+
+  // 2) if any are missing, re-upload them
+  if (missing.length) {
+    await reuploadSpecificParts({
+      base, token, uploadId, file, partSize, partNumbers: missing, controller, onHint,
+    });
+  }
+
+  // 3) finalize once more
+  return await completeUpload(base, token, uploadId, finalHex);
+}
+
+// ---------------- UI subcomponents ----------------
 function FieldLabel({ children, hint }:{ children:React.ReactNode; hint?:string }){
   return <label className="fieldlbl" title={hint}>{children}</label>;
 }
@@ -234,6 +374,7 @@ function StatusBadge({ kind, label }:{ kind:"ok"|"warn"|"err"|"idle"; label:stri
   return <span className={`badge ${kind}`}>{label}</span>;
 }
 
+// ---------------- Main component ----------------
 export default function UploadDashboard(){
   const [theme,setTheme]=useState(()=> localStorage.getItem("cd-theme")==="light"?"light":"dark");
   useEffect(()=>{ document.documentElement.dataset.theme=theme; localStorage.setItem("cd-theme", theme); },[theme]);
@@ -273,15 +414,29 @@ export default function UploadDashboard(){
   const [batches,setBatches] = useState<Batch[]>(()=>{
     try{
       const raw=localStorage.getItem(LS_BATCHES);
-      if (raw){ const basic:Omit<Batch,"files">[]=JSON.parse(raw)||[]; return basic.map(b=>({...b, files:[]})); }
+      if (raw){
+        const saved = JSON.parse(raw)||[];
+        return (saved as any[]).map(b=>({
+          id: b.id, title: b.title, createdAt: b.createdAt, expanded: !!b.expanded,
+          files: [],
+          did: b.did || "", docid: b.docid || "", doctype: b.doctype || "",
+          docname: b.docname || b.dockname || "", path: b.path || "",
+        }));
+      }
     }catch{}
     const id = makeId();
-    const initial:Batch = { id, title: humanTitle(new Date()), createdAt: Date.now(), expanded:true, files:[] };
+    const initial:Batch = {
+      id, title: humanTitle(new Date()), createdAt: Date.now(), expanded:true, files:[],
+      did:"", docid:"", doctype:"", docname:"", path:""
+    };
     persistShells([initial]);
     return [initial];
   });
   function persistShells(list:Batch[]){
-    const shells=list.map(b=>({id:b.id,title:b.title,createdAt:b.createdAt,expanded:b.expanded}));
+    const shells=list.map(b=>({
+      id:b.id,title:b.title,createdAt:b.createdAt,expanded:b.expanded,
+      did:b.did||"", docid:b.docid||"", doctype:b.doctype||"", docname:b.docname||"", path:b.path||"",
+    }));
     localStorage.setItem(LS_BATCHES, JSON.stringify(shells));
   }
   function humanTitle(d=new Date()){
@@ -291,17 +446,20 @@ export default function UploadDashboard(){
   function makeId(){ const a=new Uint8Array(8); crypto.getRandomValues(a); return [...a].map(b=>b.toString(16).padStart(2,"0")).join(""); }
   const addBatch = ()=> {
     const id=makeId();
-    const b:Batch={ id, title:humanTitle(), createdAt:Date.now(), expanded:true, files:[] };
+    const b:Batch={ id, title:humanTitle(), createdAt:Date.now(), expanded:true, files:[],
+      did:"", docid:"", doctype:"", docname:"", path:""
+    };
     setBatches(prev=>{ const next=[b, ...prev]; persistShells(next); return next; });
   };
 
-  // PROGRESS + SPEED (WS + client polling fallback)
+  // PROGRESS + SPEED (WS + fallback)
   const speedRefs = useRef<Map<string,SpeedWindow>>(new Map());
   const lastServerBytes = useRef<Map<string, { t:number; b:number }>>(new Map());
   const wsMap = useRef<Map<string,WebSocket>>(new Map());
   const serverProgress = useRef<Map<string,{percent:number;bytesReceived:number;receivedParts:number;expectedParts:number;batchId:string}>>(new Map());
   const lastPolledAt = useRef<Map<string, number>>(new Map());
 
+  useEffect(() => () => { wsMap.current.forEach(ws => { try { ws.close(); } catch {} }); wsMap.current.clear(); }, []);
   useEffect(()=>{
     const iv=setInterval(()=>{
       batches.forEach(batch=>batch.files.forEach(f=>{
@@ -326,7 +484,6 @@ export default function UploadDashboard(){
           if (m?.type === "progress" && m.uploadId === uploadId){
             const now = Date.now();
             const cur = Number(m.bytesReceived) || 0;
-
             serverProgress.current.set(uploadId, {
               percent: Number(m.percent) || 0,
               bytesReceived: cur,
@@ -334,7 +491,6 @@ export default function UploadDashboard(){
               expectedParts: Number(m.expectedParts) || 0,
               batchId: String(m.batchId || ""),
             });
-
             const sw = speedRefs.current.get(uploadId) ?? new SpeedWindow(10_000);
             speedRefs.current.set(uploadId, sw);
             const prev = lastServerBytes.current.get(uploadId);
@@ -343,8 +499,6 @@ export default function UploadDashboard(){
               if (delta > 0) sw.push(delta);
             }
             lastServerBytes.current.set(uploadId, { t: now, b: cur });
-
-            // Flip states based on observed server bytes
             setBatches(prev => prev.map(b => ({
               ...b,
               files: b.files.map(f => {
@@ -370,7 +524,21 @@ export default function UploadDashboard(){
     } catch {}
   }
 
-  // POLLING FALLBACK (1s): for uploads without an active WS
+  // ---------- CLEANUP ARTIFACTS (NEW) ----------
+  function cleanupUploadArtifacts(uploadId?: string) {
+    if (!uploadId) return;
+    try { wsMap.current.get(uploadId)?.close(); } catch {}
+    wsMap.current.delete(uploadId);
+    serverProgress.current.delete(uploadId);
+    lastServerBytes.current.delete(uploadId);
+    lastPolledAt.current.delete(uploadId);
+    if (resumesRef.current[uploadId]) {
+      delete resumesRef.current[uploadId];
+      saveResumes();
+    }
+  }
+
+  // POLLING FALLBACK (1s)
   useEffect(()=>{
     const tick = async () => {
       const now = Date.now();
@@ -465,7 +633,6 @@ export default function UploadDashboard(){
     const queue=batch.files.filter(f=>["queued","paused","error"].includes(f.status)).map(f=>f.key);
     if (!queue.length) return;
 
-    // Optimistically mark -> uploading and set startedAt immediately
     setBatches(prev=>prev.map(b=>b.id!==batchId?b:{...b, files:b.files.map(it=>{
       if (!queue.includes(it.key)) return it;
       return {
@@ -490,6 +657,7 @@ export default function UploadDashboard(){
     await Promise.allSettled(runners);
   };
 
+  // Upload one file
   const uploadOne = async (batchId:string, key:FileKey)=>{
     const batch=batches.find(bb=>bb.id===batchId); if (!batch) return;
     let item=batch.files.find(x=>x.key===key); if (!item) return;
@@ -505,12 +673,18 @@ export default function UploadDashboard(){
     let partSize=item.partSize ?? settings.partSizeBytes;
 
     try{
-      const sess = await createOrResumeBatch(settings.serverUrl, settings.token, item.file, settings.partSizeBytes, batchId, uploadId, (p)=>mergeServerHints(setHints,p));
+      const sess = await createOrResumeBatch(
+        settings.serverUrl, settings.token, item.file, settings.partSizeBytes, batch, uploadId,
+        (p)=>mergeServerHints(setHints,p)
+      );
       uploadId=sess.id; partSize=sess.partSize;
       update({ uploadId, partSize });
       resumesRef.current[uploadId]={ partSize }; saveResumes();
       ensureWs(uploadId, sess.wsToken);
-    }catch(e:any){ throw new Error(e?.message || "Create/resume failed"); }
+    }catch(e:any){
+      const msg = e?.body?.detail || e?.message || "Create/resume failed";
+      throw new Error(msg);
+    }
 
     const totalParts = Math.ceil(item.file.size / partSize);
     let have = new Set<number>();
@@ -523,76 +697,132 @@ export default function UploadDashboard(){
     update({ partsTotal: totalParts, partsDone, bytesSent });
 
     const pending:number[]=[]; for(let pn=1;pn<=totalParts;pn++) if(!have.has(pn)) pending.push(pn);
-    const PART_WORKERS=4;
+    const PART_WORKERS = Math.max(1, Math.min((hints.maxChunksPerUpload ?? 4), 8));
+
+    async function uploadPart(pn:number){
+      if (controller.signal.aborted) return;
+      const start = (pn - 1) * partSize!;
+      const end   = Math.min(item!.file.size, start + partSize!);
+      const blob  = item!.file.slice(start, end);
+      const len   = end - start;
+
+      const buf     = await blob.arrayBuffer();
+      const digest  = await sha256(buf);
+      const s256b64 = toBase64(digest);
+
+      const token = await withBackoff(
+        async () => await getPartToken(
+          settings.serverUrl, settings.token, uploadId!, pn, len, s256b64,
+          (p)=>mergeServerHints(setHints,p)
+        ),
+        5
+      );
+
+      await withBackoff(async () => {
+        await putPart(
+          settings.serverUrl, settings.token, uploadId!, pn, blob, token, s256b64,
+          controller.signal, (p)=>mergeServerHints(setHints,p)
+        );
+        partsDone += 1;
+        bytesSent += len;
+        sp.push(len);
+        const bps    = sp.bps();
+        const remain = item!.file.size - bytesSent;
+        const eta    = bps > 0 ? (remain / bps) * 1000 : NaN;
+        update({ partsDone, bytesSent, speedBps: bps, etaMs: eta });
+      }, 5);
+    }
 
     const workers = Array.from({ length: PART_WORKERS }, async () => {
       while (pending.length && !controller.signal.aborted) {
         const pn = pending.shift()!;
-        await part(pn);
+        await uploadPart(pn);
       }
     });
 
-    function part(pn: number) {
-      return (async () => {
-        if (controller.signal.aborted) return;
-        const start = (pn - 1) * partSize!;
-        const end   = Math.min(item!.file.size, start + partSize!);
-        const blob  = item!.file.slice(start, end);
-        const len   = end - start;
-
-        const buf     = await blob.arrayBuffer();
-        const digest  = await sha256(buf);
-        const s256b64 = toBase64(digest);
-
-        const token = await withBackoff(
-          async () => await getPartToken(
-            settings.serverUrl, settings.token, uploadId!, pn, len, s256b64,
-            (p)=>mergeServerHints(setHints,p)
-          ),
-          5
-        );
-
-        await withBackoff(async () => {
-          await putPart(
-            settings.serverUrl, settings.token, uploadId!, pn, blob, token, s256b64,
-            controller.signal, (p)=>mergeServerHints(setHints,p)
-          );
-          partsDone += 1;
-          bytesSent += len;
-          sp.push(len);
-          const bps    = sp.bps();
-          const remain = item!.file.size - bytesSent;
-          const eta    = bps > 0 ? (remain / bps) * 1000 : NaN;
-          update({ partsDone, bytesSent, speedBps: bps, etaMs: eta });
-        }, 5);
-      })();
-    }
-
     try{
       await Promise.all(workers);
+
       if (controller.signal.aborted){
         const paused=batches.find(bb=>bb.id===batchId)?.files.find(x=>x.key===key)?.status==="paused";
         update({ status: paused ? "paused" : "canceled" });
         return;
       }
+
+      update({ message: "Finalizing… verifying parts on server" });
+      await waitForAllParts(settings.serverUrl, settings.token, uploadId!, totalParts);
+
       let finalHex: string | undefined;
-      if (settings.finalizeChecksum){ const all=await item.file.arrayBuffer(); finalHex=toHex(await sha256(all)); }
-      await completeUpload(settings.serverUrl, settings.token, uploadId!, finalHex);
+      const FINALIZE_RAM_CAP = 512 * 1024 * 1024;
+      if (settings.finalizeChecksum && item.file.size <= FINALIZE_RAM_CAP){
+        const all=await item.file.arrayBuffer();
+        finalHex=toHex(await sha256(all));
+      }
+
+      // FIRST attempt to complete, then repair on "missing_part_*" or similar
+      try {
+        await completeUpload(settings.serverUrl, settings.token, uploadId!, finalHex);
+      } catch (e: any) {
+        const missing = parseMissingPartsFromError(e);
+        if (missing.length) {
+          await repairThenComplete({
+            base: settings.serverUrl,
+            token: settings.token,
+            uploadId: uploadId!,
+            file: item.file,
+            partSize: partSize!,
+            finalHex,
+            controller: controller.signal,
+            onHint: (p) => mergeServerHints(setHints, p),
+          });
+        } else {
+          throw e;
+        }
+      }
 
       const startedAtVal = item.startedAt ?? item.createdAt;
       const elapsed = Math.max(0, Date.now() - startedAtVal);
       const avgBps = elapsed > 0 ? (item.file.size * 1000) / elapsed : 0;
+      update({
+        status:"done", message:"Completed", speedBps:0, etaMs:0,
+        partsDone: totalParts, bytesSent: item.file.size,
+        finalAvgBps: avgBps, totalTimeMs: elapsed
+      });
 
-      update({ status:"done", message:"Completed", speedBps:0, etaMs:0, partsDone:totalParts, bytesSent:item.file.size, finalAvgBps: avgBps, totalTimeMs: elapsed });
+      // --------- CLEANUP after success (NEW) ---------
+      cleanupUploadArtifacts(uploadId!);
+
     }catch(e:any){
       if (controller.signal.aborted){
         const paused=batches.find(bb=>bb.id===batchId)?.files.find(x=>x.key===key)?.status==="paused";
         update({ status: paused ? "paused" : "canceled" });
       }else{
-        update({ status:"error", message:String(e?.message||e) });
+        const msg = e?.body?.detail || e?.message || String(e);
+        update({ status:"error", message: msg });
+        // --------- CLEANUP after error (NEW) ---------
+        cleanupUploadArtifacts(uploadId!);
       }
     }
   };
+
+  // ---------- waitForAllParts ----------
+  async function waitForAllParts(
+    base: string,
+    token: string,
+    uploadId: string,
+    expectedParts: number,
+    timeoutMs = 180_000,
+    intervalMs = 1_500
+  ) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const st = await getStatus(base, token, uploadId);
+      const have = Array.isArray(st?.receivedParts) ? st.receivedParts.length : 0;
+      if (have >= expectedParts) return st;
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    throw new Error(`timeout_waiting_for_parts (expected ${expectedParts})`);
+  }
 
   async function withBackoff<T>(fn:(attempt:number)=>Promise<T>, max=5):Promise<T>{
     let attempt=0, last:any;
@@ -615,11 +845,7 @@ export default function UploadDashboard(){
 
   const resumeFile = (batchId:string, key:FileKey)=>{
     setBatches(prev=>prev.map(B=>B.id!==batchId?B:{...B, files:B.files.map(x=>x.key===key?{
-      ...x,
-      status:"uploading",
-      controller:new AbortController(),
-      message:"",
-      startedAt: x.startedAt ?? Date.now(),
+      ...x, status:"uploading", controller:new AbortController(), message:"", startedAt: x.startedAt ?? Date.now(),
     }:x)}));
     uploadOne(batchId,key).catch(e=> setBatches(prev=>prev.map(B=>B.id!==batchId?B:{...B, files:B.files.map(x=>x.key===key?{...x,status:"error",message:String(e)}:x)})));
   };
@@ -627,14 +853,17 @@ export default function UploadDashboard(){
   const cancelFile = async (batchId:string, key:FileKey)=>{
     const it=batches.find(b=>b.id===batchId)?.files.find(x=>x.key===key);
     if (it?.controller) it.controller.abort();
-    if (it?.uploadId) await abortUpload(settings.serverUrl, settings.token, it.uploadId);
+    if (it?.uploadId) {
+      await abortUpload(settings.serverUrl, settings.token, it.uploadId);
+      // --------- CLEANUP after cancel (NEW) ---------
+      cleanupUploadArtifacts(it.uploadId);
+    }
     setBatches(prev=>prev.map(B=>B.id!==batchId?B:{...B, files:B.files.map(x=>x.key!==key?x:{...x,status:"canceled",message:"Canceled"})}));
   };
 
   const removeFile = (batchId:string, key:FileKey)=>{
     const up=batches.find(b=>b.id===batchId)?.files.find(f=>f.key===key);
-    if (up?.uploadId) delete resumesRef.current[up.uploadId];
-    saveResumes();
+    if (up?.uploadId) cleanupUploadArtifacts(up.uploadId); // NEW
     setBatches(prev=>prev.map(B=>B.id!==batchId?B:{...B, files:B.files.filter(x=>x.key!==key)}));
   };
 
@@ -643,6 +872,15 @@ export default function UploadDashboard(){
 
   const queuedCount = batches.reduce((a,b)=> a + b.files.filter(f=>f.status==="queued").length, 0);
   const activeCount = batches.reduce((a,b)=> a + b.files.filter(f=>f.status==="uploading").length, 0);
+
+  // ⬇️ inlined batch meta updater (persisted) ⬇️
+  const updateBatchMeta = (batchId:string, patch: Partial<Pick<Batch, "did"|"docid"|"doctype"|"docname"|"path">>) => {
+    setBatches(prev => {
+      const next = prev.map(b => b.id !== batchId ? b : ({ ...b, ...patch }));
+      persistShells(next);
+      return next;
+    });
+  };
 
   return (
     <div className="page">
@@ -670,7 +908,20 @@ export default function UploadDashboard(){
             <span className="sep">•</span>
             <span>Storage: {storageText}</span>
           </div>
-          <button className="btn ghost" onClick={()=>{ setBatches([]); persistShells([]); localStorage.removeItem(LS_RESUMES); }}>Clear All</button>
+          <button
+            className="btn ghost"
+            onClick={()=>{
+              // --------- CLEANUP for ALL (NEW) ---------
+              batches.forEach(b => b.files.forEach(f => cleanupUploadArtifacts(f.uploadId)));
+              wsMap.current.forEach(ws => { try { ws.close(); } catch {} });
+              wsMap.current.clear();
+              setBatches([]);
+              persistShells([]);
+              localStorage.removeItem(LS_RESUMES);
+            }}
+          >
+            Clear All
+          </button>
           <button className="btn" disabled={!canStart} onClick={startAll}>Start All</button>
           <button className="btn ghost toggle" onClick={()=>setTheme(t=>t==="dark"?"light":"dark")}>{theme==="dark"?"☼":"☾"}</button>
         </div>
@@ -693,26 +944,65 @@ export default function UploadDashboard(){
           <div className="grid3">
             <div>
               <FieldLabel hint="Size of each chunk in bytes">Part size (bytes)</FieldLabel>
-              <input type="number" min={1024*1024} step={1024*1024}
-                     value={settings.partSizeBytes}
-                     onChange={e=>setSettings(s=>({...s, partSizeBytes: Math.max(1024*1024, parseInt(e.target.value||"0",10))}))}/>
+              <input
+                type="number" min={1024*1024} step={1024*1024}
+                value={settings.partSizeBytes}
+                onChange={e=>setSettings(s=>({...s, partSizeBytes: Math.max(1024*1024, parseInt(e.target.value||"0",10))}))}
+              />
               <div className="hint">Usually 5–50 MiB; server min/max apply</div>
             </div>
             <div>
               <FieldLabel hint="How many files upload at once (across batches)">Parallel files</FieldLabel>
-              <input type="number" min={1} max={8}
-                     value={settings.fileConcurrency}
-                     onChange={e=>setSettings(s=>({...s, fileConcurrency: Math.min(8, Math.max(1, parseInt(e.target.value||"1",10))) }))}/>
+              <input
+                type="number" min={1} max={8}
+                value={settings.fileConcurrency}
+                onChange={e=>setSettings(s=>({...s, fileConcurrency: Math.min(8, Math.max(1, parseInt(e.target.value||"1",10))) }))}
+              />
             </div>
             <div className="checkbox">
               <FieldLabel hint="Send final file checksum to server when complete">Finalize with SHA-256</FieldLabel>
               <div className="row">
                 <input id="finalize" type="checkbox" checked={settings.finalizeChecksum}
                        onChange={e=>setSettings(s=>({...s, finalizeChecksum:e.target.checked }))}/>
-                <label htmlFor="finalize" className="hint">Send final file checksum to server on complete</label>
+                <label htmlFor="finalize" className="hint">Send final file checksum to server on complete (browser will skip huge files)</label>
               </div>
             </div>
           </div>
+
+          {/* Batch metadata (user-editable) */}
+          {batches[0] && (
+            <div className="limits" style={{ marginTop: 14 }}>
+              <div className="limits-title">Batch metadata</div>
+              <div className="grid3">
+                <div>
+                  <FieldLabel hint="Decentralized Identifier for ownership context">DID</FieldLabel>
+                  <input type="text" value={batches[0]?.did||""} onChange={e=>updateBatchMeta(batches[0].id,{did:e.target.value})} placeholder="did:bethel:main:8788c111-..." />
+                </div>
+                <div>
+                  <FieldLabel hint="Document ID">Doc ID</FieldLabel>
+                  <input type="text" value={batches[0]?.docid||""} onChange={e=>updateBatchMeta(batches[0].id,{docid:e.target.value})} placeholder="DOC-123" />
+                </div>
+                <div>
+                  <FieldLabel hint="Classification or type of the document">Doc Type</FieldLabel>
+                  <input type="text" value={batches[0]?.doctype||""} onChange={e=>updateBatchMeta(batches[0].id,{doctype:e.target.value})} placeholder="invoice, video, ..." />
+                </div>
+              </div>
+              <div className="grid3" style={{marginTop:8}}>
+                <div>
+                  <FieldLabel hint="Human-friendly document name">Doc Name</FieldLabel>
+                  <input type="text" value={batches[0]?.docname||""} onChange={e=>updateBatchMeta(batches[0].id,{docname:e.target.value})} placeholder="Q3 Billing"/>
+                </div>
+                <div>
+                  <FieldLabel hint="Virtual path / folder for the batch">Path</FieldLabel>
+                  <input type="text" value={batches[0]?.path||""} onChange={e=>updateBatchMeta(batches[0].id,{path:e.target.value})} placeholder="/org/acme/2025/q3"/>
+                </div>
+                <div>
+                  <FieldLabel hint="Files descriptor sent for hashing (auto)">Files Input</FieldLabel>
+                  <input type="text" value={`${batches[0]?.files.length ?? 0} file(s)`} readOnly/>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Limits (read-only) */}
           <div className="limits">
@@ -753,7 +1043,9 @@ export default function UploadDashboard(){
         const totalBytes = batch.files.reduce((a,f)=>a+f.file.size,0);
         const uploaded = batch.files.reduce((a,f)=>{
           const sv = f.uploadId ? serverProgress.current.get(f.uploadId) : undefined;
-          return a + (sv ? sv.bytesReceived : f.bytesSent);
+          const server = sv?.bytesReceived ?? 0;
+          const client = f.bytesSent ?? 0;
+          return a + Math.max(server, client);
         },0);
         const pct = totalBytes>0 ? Math.floor((uploaded/totalBytes)*100) : 0;
         const queued = batch.files.filter(f=>f.status==="queued").length;
@@ -770,7 +1062,16 @@ export default function UploadDashboard(){
                 <div className="bsub"><span>{queued} queued</span><span className="sep">•</span><span>{active} active</span><span className="sep">•</span><span>{fmtBytes(uploaded)} / {fmtBytes(totalBytes)}</span></div>
               </div>
               <div className="bactions">
-                <button className="btn ghost" onClick={()=> setBatches(prev=>prev.map(b=>b.id!==batch.id?b:{...b, files:[]}))}>Clear Batch</button>
+                <button
+                  className="btn ghost"
+                  onClick={()=>{
+                    // --------- CLEANUP when clearing a batch (NEW) ---------
+                    batch.files.forEach(f => cleanupUploadArtifacts(f.uploadId));
+                    setBatches(prev=>prev.map(b=>b.id!==batch.id?b:{...b, files:[]}));
+                  }}
+                >
+                  Clear Batch
+                </button>
                 <button className="btn" disabled={!batch.files.some(f=>["queued","paused","error"].includes(f.status)) || !settings.token || !settings.serverUrl} onClick={()=>startBatch(batch.id)}>Start Batch</button>
               </div>
             </div>
@@ -803,7 +1104,6 @@ export default function UploadDashboard(){
 
             {batch.expanded && (
               <>
-                {/* Single, compact drop zone */}
                 <div className="droparea"
                      onDragOver={e=>{e.preventDefault(); e.currentTarget.classList.add("dragging");}}
                      onDragLeave={e=>{e.currentTarget.classList.remove("dragging");}}
@@ -824,21 +1124,22 @@ export default function UploadDashboard(){
                   </div>
                 </div>
 
-                {/* Files */}
                 <div className="table">
                   <div className="thead"><div>File</div><div className="right">Size</div><div style={{width:520}}>Progress</div><div className="right">Speed</div><div className="right">ETA</div><div className="right">Actions</div></div>
                   {batch.files.length===0 && <div className="empty">No files yet — add some above.</div>}
                   {batch.files.map(fi=>{
                     const sv = fi.uploadId ? serverProgress.current.get(fi.uploadId) : undefined;
-                    const serverPct = sv?.percent;
+                    const serverPct = sv?.percent ?? 0;
                     const clientPct = fi.partsTotal ? Math.floor((fi.partsDone/fi.partsTotal)*100) : 0;
-                    const displayPct = Number.isFinite(serverPct as any) ? (serverPct as number) : clientPct;
-                    const partsText = sv ? `${sv.receivedParts}/${sv.expectedParts} parts` : `${fi.partsDone}/${fi.partsTotal} parts`;
+                    const displayPct = Math.max(Number.isFinite(serverPct) ? serverPct : 0, clientPct);
+                    const partsText = sv
+                      ? `${Math.max(sv.receivedParts||0, fi.partsDone||0)}/${sv.expectedParts||fi.partsTotal} parts`
+                      : `${fi.partsDone}/${fi.partsTotal} parts`;
 
-                    const bytesDone = sv ? sv.bytesReceived : fi.bytesSent;
-                    const bytesText = `${fmtBytes(bytesDone)} / ${fmtBytes(fi.file.size)}`;
+                    const serverBytes = sv?.bytesReceived ?? 0;
+                    const bytesDone   = Math.max(serverBytes, fi.bytesSent);
+                    const bytesText   = `${fmtBytes(bytesDone)} / ${fmtBytes(fi.file.size)}`;
 
-                    // Prefer WS/poll speed; fallback to client-side speed
                     const wsSw = fi.uploadId ? speedRefs.current.get(fi.uploadId) : undefined;
                     const wsBps = wsSw?.bps() || 0;
                     const currBps = wsBps > 0 ? wsBps : fi.speedBps;
