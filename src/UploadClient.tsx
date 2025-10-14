@@ -1,4 +1,3 @@
-// UploadDashboard.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /** =========================================================
@@ -10,9 +9,10 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  *  - Resumable (createOrResumeBatch + /uploads/:id/status)
  *  - Waits for all parts on server before /complete
  *  - Clear error surfacing (incl. /complete 400s)
- *  - Collects DID, Doc ID, Doc Type, Doc Name, Path (no Batch Type / Job / Job ID)
  *  - Repairs missing parts on /complete errors, then retries /complete
  *  - NEW (fix): Cleans local resume/progress/WS artifacts on done/cancel/error/remove/clear
+ *  - NEW: Treat batch_not_ready & Bethel transient errors as soft success
+ *  - NEW: Backoff when re-finalizing after repair
  * ========================================================= */
 
 type ServerSession = { id: string; wsToken?: string; partSize: number; batchId: string };
@@ -67,7 +67,10 @@ type ServerHints = {
   globalUploadLimit?: number;
   maxBytesPerMinute?: number;
   fileSizeMax?: number;
+  // NEW
+  minPartsPerFile?: number;
 };
+
 
 const LS_SETTINGS = "chunkDash:v9:settings";
 const LS_RESUMES  = "chunkDash:v9:resumes";
@@ -143,11 +146,15 @@ function mergeServerHints(setter: React.Dispatch<React.SetStateAction<ServerHint
       globalUploadLimit: payload.globalUploadLimit ?? prev.globalUploadLimit,
       maxBytesPerMinute: payload.maxBytesPerMinute ?? prev.maxBytesPerMinute,
       fileSizeMax: payload.fileSizeMax ?? prev.fileSizeMax,
+      // NEW
+      minPartsPerFile: payload.minPartsPerFile ?? prev.minPartsPerFile,
     };
     if (Number.isFinite(payload?.min)) next.partSizeMin = payload.min;
     if (Number.isFinite(payload?.max)) next.partSizeMax = payload.max;
     if (Number.isFinite(payload?.limit)) next.maxChunksPerUpload ??= payload.limit;
     if (Number.isFinite(payload?.limitPerMinute)) next.maxBytesPerMinute = payload.limitPerMinute;
+    // alias guards
+    if (Number.isFinite(payload?.minParts)) next.minPartsPerFile = payload.minParts;
     return next;
   });
 }
@@ -302,6 +309,27 @@ async function listParts(base: string, token: string, uploadId: string) {
   return j;
 }
 
+// ---------- NEW: classify finalize errors ----------
+function isBatchNotReadyError(e: any) {
+  const body = e?.body || {};
+  const err  = String(body?.error || "");
+  const detail = String(body?.detail || "");
+  // 409 path (?requireBethelNow=1) or 5xx payloads flagging batch-not-ready
+  return err === "batch_not_ready_for_bethel" || detail === "batch_not_ready";
+}
+function isBethelTransientError(e: any) {
+  const body = e?.body || {};
+  if (body?.bethel === "failed") {
+    const reason = String(body?.reason || "");
+    const detail = String(body?.detail || "");
+    return (
+      reason === "bethel_error" ||
+      /timeout|bad gateway|network|502|503|504|fetch failed|ECONNRESET|EAI_AGAIN/i.test(detail)
+    );
+  }
+  return false;
+}
+
 function parseMissingPartsFromError(e: any): number[] {
   const body = e?.body || {};
   const err = body?.error || "";
@@ -361,9 +389,42 @@ async function repairThenComplete({
     });
   }
 
-  // 3) finalize once more
-  return await completeUpload(base, token, uploadId, finalHex);
+  // 3) finalize once more (with backoff) — soft accept batch-not-ready / Bethel transient
+  return await withBackoff(async () => {
+    try {
+      return await completeUpload(base, token, uploadId, finalHex);
+    } catch (e: any) {
+      if (isBatchNotReadyError(e) || isBethelTransientError(e)) {
+        return { ok: true, soft: true };
+      }
+      throw e;
+    }
+  }, 4);
 }
+
+// Simple exponential backoff with optional server-provided retryAfterMs
+async function withBackoff<T>(
+  fn: (attempt: number) => Promise<T>,
+  max = 5
+): Promise<T> {
+  let attempt = 0;
+  let lastErr: any;
+  while (attempt < max) {
+    attempt++;
+    try {
+      return await fn(attempt);
+    } catch (e: any) {
+      lastErr = e;
+      if (attempt >= max) break;
+      const jitter = Math.random() * 200;
+      const serverBackoff = Number(e?.retryAfterMs || 0);
+      const backoff = serverBackoff || Math.min(30_000, 600 * 2 ** (attempt - 1)) + jitter;
+      await new Promise((r) => setTimeout(r, backoff));
+    }
+  }
+  throw lastErr;
+}
+
 
 // ---------------- UI subcomponents ----------------
 function FieldLabel({ children, hint }:{ children:React.ReactNode; hint?:string }){
@@ -443,7 +504,7 @@ export default function UploadDashboard(){
     const pad = (n:number)=> String(n).padStart(2,"0");
     return `Batch ${pad(d.getMonth()+1)}/${pad(d.getDate())}/${d.getFullYear()}, ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   }
-  function makeId(){ const a=new Uint8Array(8); crypto.getRandomValues(a); return [...a].map(b=>b.toString(16).padStart(2,"0")).join(""); }
+  function makeId(){ const a=new Uint8Array(8); crypto.getRandomValues(a); return [...a].map(b=>b.toString(16).padStart(2, "0")).join(""); }
   const addBatch = ()=> {
     const id=makeId();
     const b:Batch={ id, title:humanTitle(), createdAt:Date.now(), expanded:true, files:[],
@@ -616,15 +677,26 @@ export default function UploadDashboard(){
       for (const f of incoming){
         const key=keyOf(f);
         if (next.some(x=>x.key===key)) continue;
+
+        // NEW: respect server's minPartsPerFile when estimating parts before session creation
+        const minParts = Number(hints.minPartsPerFile || 0);
+        let estPartSize = Math.max(1, settings.partSizeBytes);
+        if (minParts > 0) {
+          const cap = Math.max(1, Math.floor(f.size / minParts)); // force >= minParts
+          estPartSize = Math.min(estPartSize, cap);
+        }
+        const estTotal = Math.ceil(f.size / estPartSize);
+
         next.push({
           key, file:f, status:"queued", bytesSent:0, partsDone:0,
-          partsTotal: Math.ceil(f.size / Math.max(1, settings.partSizeBytes)),
+          partsTotal: estTotal,
           speedBps:0, etaMs:NaN, createdAt:Date.now(),
         });
       }
       return {...b, files:next};
     }));
   };
+
 
   const startAll = ()=> batches.forEach(b=>startBatch(b.id));
 
@@ -678,13 +750,15 @@ export default function UploadDashboard(){
         (p)=>mergeServerHints(setHints,p)
       );
       uploadId=sess.id; partSize=sess.partSize;
-      update({ uploadId, partSize });
+      // UPDATED: set partsTotal based on the server-enforced partSize
+      update({ uploadId, partSize, partsTotal: Math.ceil(item.file.size / partSize) });
       resumesRef.current[uploadId]={ partSize }; saveResumes();
       ensureWs(uploadId, sess.wsToken);
     }catch(e:any){
       const msg = e?.body?.detail || e?.message || "Create/resume failed";
       throw new Error(msg);
     }
+
 
     const totalParts = Math.ceil(item.file.size / partSize);
     let have = new Set<number>();
@@ -775,6 +849,8 @@ export default function UploadDashboard(){
             controller: controller.signal,
             onHint: (p) => mergeServerHints(setHints, p),
           });
+        } else if (isBatchNotReadyError(e) || isBethelTransientError(e)) {
+          // Soft success – file is uploaded; batch will finalize later
         } else {
           throw e;
         }
@@ -797,10 +873,28 @@ export default function UploadDashboard(){
         const paused=batches.find(bb=>bb.id===batchId)?.files.find(x=>x.key===key)?.status==="paused";
         update({ status: paused ? "paused" : "canceled" });
       }else{
-        const msg = e?.body?.detail || e?.message || String(e);
-        update({ status:"error", message: msg });
-        // --------- CLEANUP after error (NEW) ---------
-        cleanupUploadArtifacts(uploadId!);
+        // NEW: soften batch-level transient errors; treat as done
+        if (isBatchNotReadyError(e) || isBethelTransientError(e)) {
+          const startedAtVal = item.startedAt ?? item.createdAt;
+          const elapsed = Math.max(0, Date.now() - startedAtVal);
+          const avgBps = elapsed > 0 ? (item.file.size * 1000) / elapsed : 0;
+          update({
+            status: "done",
+            message: "Uploaded. Waiting for batch finalize…",
+            speedBps: 0,
+            etaMs: 0,
+            partsDone: Math.ceil(item.file.size / partSize!),
+            bytesSent: item.file.size,
+            finalAvgBps: avgBps,
+            totalTimeMs: elapsed
+          });
+          cleanupUploadArtifacts(uploadId!);
+        } else {
+          const msg = e?.body?.detail || e?.message || String(e);
+          update({ status:"error", message: msg });
+          // --------- CLEANUP after error (NEW) ---------
+          cleanupUploadArtifacts(uploadId!);
+        }
       }
     }
   };
@@ -1027,6 +1121,8 @@ export default function UploadDashboard(){
               <div><span>Global chunk limit</span><b>{hints.globalUploadLimit ?? "—"}</b></div>
               <div><span>Per-minute user cap</span><b>{hints.maxBytesPerMinute ? fmtBytes(hints.maxBytesPerMinute) : "—"}</b></div>
               <div><span>Max file size</span><b>{hints.fileSizeMax ? fmtBytes(hints.fileSizeMax) : "—"}</b></div>
+              {/* NEW */}
+              <div><span>Min parts / file</span><b>{hints.minPartsPerFile ?? "—"}</b></div>
             </div>
             <div className="hint">Auto-fills from <code>/limits</code> if present; otherwise learns from error payloads.</div>
           </div>
