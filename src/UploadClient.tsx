@@ -319,13 +319,23 @@ function isBatchNotReadyError(e: any) {
 }
 function isBethelTransientError(e: any) {
   const body = e?.body || {};
+  // If the error object includes Bethel metadata, inspect reason and detail.
   if (body?.bethel === "failed") {
     const reason = String(body?.reason || "");
     const detail = String(body?.detail || "");
+    // If the failure is because some files are not yet completed, treat as batch-not-ready rather than transient.
+    if (reason === 'some_files_not_completed' || detail === 'batch_not_ready') {
+      return false;
+    }
     return (
       reason === "bethel_error" ||
       /timeout|bad gateway|network|502|503|504|fetch failed|ECONNRESET|EAI_AGAIN/i.test(detail)
     );
+  }
+  // Otherwise, fall back to parsing the error message for transient 5xx conditions.
+  const msg = String(e?.message || "");
+  if (/\(5\d{2}\)/.test(msg) || /bad gateway|timeout|network|fetch failed|502|503|504/i.test(msg)) {
+    return true;
   }
   return false;
 }
@@ -466,10 +476,24 @@ export default function UploadDashboard(){
     }catch{ setStorageText("—"); }
   })(); },[]);
 
-  const readResumes = ():Record<string,{partSize:number}> => {
-    try{ return JSON.parse(localStorage.getItem(LS_RESUMES) || "{}") || {}; }catch{ return {}; }
+  // Persist a mapping of file keys to their resume information.
+  // Each entry maps a FileKey (name::size::mtime) to the last known uploadId and partSize for that file.
+  // This allows us to re-use uploadIds across retries or when the user re-adds the same file.
+  type ResumeInfo = { uploadId: string; partSize: number };
+  const readResumes = (): Record<string, ResumeInfo> => {
+    try {
+      const raw = localStorage.getItem(LS_RESUMES);
+      if (!raw) return {};
+      // Stored format is { [fileKey]: { uploadId, partSize } }
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") return parsed as Record<string, ResumeInfo>;
+      return {};
+    } catch {
+      return {};
+    }
   };
-  const resumesRef = useRef<Record<string,{partSize:number}>>(readResumes());
+  // refs allow us to mutate the resume map without re-rendering; updates are persisted via saveResumes().
+  const resumesRef = useRef<Record<string, ResumeInfo>>(readResumes());
   const saveResumes = () => localStorage.setItem(LS_RESUMES, JSON.stringify(resumesRef.current));
 
   const [batches,setBatches] = useState<Batch[]>(()=>{
@@ -586,16 +610,31 @@ export default function UploadDashboard(){
   }
 
   // ---------- CLEANUP ARTIFACTS (NEW) ----------
-  function cleanupUploadArtifacts(uploadId?: string) {
+  function cleanupUploadArtifacts(
+    uploadId?: string,
+    opts?: { keepResume?: boolean }
+  ) {
+    // Close any websocket and clear progress caches regardless of resume cleanup.
     if (!uploadId) return;
-    try { wsMap.current.get(uploadId)?.close(); } catch {}
+    try {
+      wsMap.current.get(uploadId)?.close();
+    } catch {}
     wsMap.current.delete(uploadId);
     serverProgress.current.delete(uploadId);
     lastServerBytes.current.delete(uploadId);
     lastPolledAt.current.delete(uploadId);
-    if (resumesRef.current[uploadId]) {
-      delete resumesRef.current[uploadId];
-      saveResumes();
+
+    // Remove the corresponding resume entry unless instructed to keep it for a retry.
+    if (!opts?.keepResume) {
+      // Find the fileKey whose resume info references this uploadId.
+      const entries = Object.entries(resumesRef.current);
+      for (const [fk, info] of entries) {
+        if (info && info.uploadId === uploadId) {
+          delete resumesRef.current[fk];
+          saveResumes();
+          break;
+        }
+      }
     }
   }
 
@@ -674,11 +713,32 @@ export default function UploadDashboard(){
     setBatches(prev=>prev.map(b=>{
       if (b.id!==batchId) return b;
       const next=[...b.files];
-      for (const f of incoming){
-        const key=keyOf(f);
-        if (next.some(x=>x.key===key)) continue;
+      for (const f of incoming) {
+        const fileKey = keyOf(f);
+        if (next.some(x => x.key === fileKey)) continue;
 
-        // NEW: respect server's minPartsPerFile when estimating parts before session creation
+        // Check if we have resume information for this file. If so, prepopulate the uploadId and partSize.
+        const resumeInfo = resumesRef.current[fileKey];
+        if (resumeInfo && resumeInfo.uploadId) {
+          const { uploadId, partSize } = resumeInfo;
+          const totalParts = Math.ceil(f.size / partSize);
+          next.push({
+            key: fileKey,
+            file: f,
+            status: "queued",
+            bytesSent: 0,
+            partsDone: 0,
+            partsTotal: totalParts,
+            speedBps: 0,
+            etaMs: NaN,
+            createdAt: Date.now(),
+            uploadId,
+            partSize,
+          });
+          continue;
+        }
+
+        // No resume info – use estimated partSize based on hints and settings.
         const minParts = Number(hints.minPartsPerFile || 0);
         let estPartSize = Math.max(1, settings.partSizeBytes);
         if (minParts > 0) {
@@ -688,9 +748,15 @@ export default function UploadDashboard(){
         const estTotal = Math.ceil(f.size / estPartSize);
 
         next.push({
-          key, file:f, status:"queued", bytesSent:0, partsDone:0,
+          key: fileKey,
+          file: f,
+          status: "queued",
+          bytesSent: 0,
+          partsDone: 0,
           partsTotal: estTotal,
-          speedBps:0, etaMs:NaN, createdAt:Date.now(),
+          speedBps: 0,
+          etaMs: NaN,
+          createdAt: Date.now(),
         });
       }
       return {...b, files:next};
@@ -744,18 +810,55 @@ export default function UploadDashboard(){
     let uploadId=item.uploadId ?? null;
     let partSize=item.partSize ?? settings.partSizeBytes;
 
-    try{
-      const sess = await createOrResumeBatch(
-        settings.serverUrl, settings.token, item.file, settings.partSizeBytes, batch, uploadId,
-        (p)=>mergeServerHints(setHints,p)
-      );
-      uploadId=sess.id; partSize=sess.partSize;
+    try {
+      // Attempt to create or resume the upload session. If the resumeId does not exist
+      // on the server, gracefully fall back to a fresh upload by clearing the
+      // resume entry and retrying.
+      let sess: ServerSession | null = null;
+      let triedResume = false;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          sess = await createOrResumeBatch(
+            settings.serverUrl,
+            settings.token,
+            item.file,
+            settings.partSizeBytes,
+            batch,
+            attempt === 0 ? uploadId : null,
+            (p) => mergeServerHints(setHints, p)
+          );
+          break;
+        } catch (err: any) {
+          // On first attempt with resumeId, if the server rejects with
+          // resume_not_found or not_found, clear the resume mapping and retry.
+          const bodyErr = err?.body || {};
+          const code = bodyErr?.error || bodyErr?.detail || '';
+          if (attempt === 0 && uploadId && (code === 'resume_not_found' || code === 'not_found')) {
+            // Delete stale resume info and retry with fresh session
+            const fileKey = keyOf(item.file);
+            delete resumesRef.current[fileKey];
+            saveResumes();
+            uploadId = null;
+            continue;
+          }
+          // Otherwise rethrow
+          throw err;
+        }
+      }
+      if (!sess) throw new Error('Unable to create upload session');
+      uploadId = sess.id;
+      partSize = sess.partSize;
       // UPDATED: set partsTotal based on the server-enforced partSize
       update({ uploadId, partSize, partsTotal: Math.ceil(item.file.size / partSize) });
-      resumesRef.current[uploadId]={ partSize }; saveResumes();
+      // Persist resume information keyed by fileKey so that retries use the same uploadId.
+      {
+        const fileKey = keyOf(item.file);
+        resumesRef.current[fileKey] = { uploadId, partSize };
+        saveResumes();
+      }
       ensureWs(uploadId, sess.wsToken);
-    }catch(e:any){
-      const msg = e?.body?.detail || e?.message || "Create/resume failed";
+    } catch (e: any) {
+      const msg = e?.body?.detail || e?.message || 'Create/resume failed';
       throw new Error(msg);
     }
 
@@ -891,9 +994,10 @@ export default function UploadDashboard(){
           cleanupUploadArtifacts(uploadId!);
         } else {
           const msg = e?.body?.detail || e?.message || String(e);
-          update({ status:"error", message: msg });
-          // --------- CLEANUP after error (NEW) ---------
-          cleanupUploadArtifacts(uploadId!);
+          update({ status: "error", message: msg });
+          // On error we keep the resume info so that a retry can re-use the existing uploadId.
+          // We still close open connections and clear progress caches.
+          cleanupUploadArtifacts(uploadId!, { keepResume: true });
         }
       }
     }
@@ -910,7 +1014,20 @@ export default function UploadDashboard(){
   ) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      const st = await getStatus(base, token, uploadId);
+      let st: any = null;
+      try {
+        st = await getStatus(base, token, uploadId);
+      } catch (err: any) {
+        // If the server reports not_found or resume_not_found, treat as no parts yet and continue polling.
+        const bodyErr = err?.body || {};
+        const code = bodyErr?.error || bodyErr?.detail || '';
+        if (code === 'not_found' || code === 'resume_not_found') {
+          st = null;
+        } else {
+          // For other errors, rethrow to abort the wait.
+          throw err;
+        }
+      }
       const have = Array.isArray(st?.receivedParts) ? st.receivedParts.length : 0;
       if (have >= expectedParts) return st;
       await new Promise((r) => setTimeout(r, intervalMs));
