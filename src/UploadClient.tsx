@@ -2,17 +2,20 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /** =========================================================
  *  Chunk Uploader — Clean Multi-Batch UI (Real-time)
- *  - One clean drag area per batch
- *  - Server limits shown (via GET /limits if present, else learned from errors)
- *  - Speed + ETA: WS first, 1s polling fallback, client PUT fallback
- *  - Correctly flips from "queued" to "uploading" if server already received bytes
+ *  - Multi-batch
  *  - Resumable (createOrResumeBatch + /uploads/:id/status)
+ *  - Speed + ETA (WS + polling fallback)
  *  - Waits for all parts on server before /complete
- *  - Clear error surfacing (incl. /complete 400s)
  *  - Repairs missing parts on /complete errors, then retries /complete
- *  - NEW (fix): Cleans local resume/progress/WS artifacts on done/cancel/error/remove/clear
- *  - NEW: Treat batch_not_ready & Bethel transient errors as soft success
- *  - NEW: Backoff when re-finalizing after repair
+ *
+ *  ✅ UPDATED: ZIP_FOLDER mode is decided ONLY by client sending:
+ *      type: "zip_folder"
+ *      Backend checks:
+ *        const isZipFolder = String(type || '').toLowerCase() === 'zip_folder';
+ *
+ *  ❌ NO auto-detection by .zip extension
+ *  ❌ NO MIME sniffing to choose zip mode
+ *  ✅ User must select "zip_folder" in UI to send it
  * ========================================================= */
 
 type ServerSession = { id: string; wsToken?: string; partSize: number; batchId: string };
@@ -51,12 +54,16 @@ type Batch = {
   createdAt: number;
   expanded: boolean;
   files: FileItem[];
+
   // user-supplied batch metadata
   did?: string;
   docid?: string;
   doctype?: string;
-  docname?: string;   // server may map to "dockname"
+  docname?: string; // server may map to "dockname"
   path?: string;
+
+  // ✅ MUST drive backend zip_folder check
+  uploadType: "normal" | "zip_folder";
 };
 
 type ServerHints = {
@@ -67,19 +74,17 @@ type ServerHints = {
   globalUploadLimit?: number;
   maxBytesPerMinute?: number;
   fileSizeMax?: number;
-  // NEW
   minPartsPerFile?: number;
 };
 
-
-const LS_SETTINGS = "chunkDash:v9:settings";
-const LS_RESUMES  = "chunkDash:v9:resumes";
-const LS_BATCHES  = "chunkDash:v9:batches";
+const LS_SETTINGS = "chunkDash:v10:settings";
+const LS_RESUMES = "chunkDash:v10:resumes";
+const LS_BATCHES = "chunkDash:v10:batches";
 
 const ENV_SERVER =
   (import.meta as any)?.env?.VITE_SERVER_URL ||
   (typeof process !== "undefined" ? (process as any)?.env?.VITE_SERVER_URL : "") ||
-  "http://localhost:3000";
+  "http://localhost:50059";
 const ENV_TOKEN =
   (import.meta as any)?.env?.VITE_UPLOAD_TOKEN ||
   (typeof process !== "undefined" ? (process as any)?.env?.VITE_UPLOAD_TOKEN : "") ||
@@ -88,23 +93,34 @@ const ENV_TOKEN =
 // ---------------- Utils ----------------
 const fmtBytes = (n: number) => {
   if (!Number.isFinite(n) || n <= 0) return "0 B";
-  const u = ["B","KB","MB","GB","TB"];
-  let i=0, x=n; while (x>=1024 && i<u.length-1) { x/=1024; i++; }
-  return `${x.toFixed(i?1:0)} ${u[i]}`;
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0,
+    x = n;
+  while (x >= 1024 && i < u.length - 1) {
+    x /= 1024;
+    i++;
+  }
+  return `${x.toFixed(i ? 1 : 0)} ${u[i]}`;
 };
+
 const fmtTime = (ms: number) => {
   if (!Number.isFinite(ms) || ms <= 0) return "—";
-  const s = Math.round(ms/1000);
+  const s = Math.round(ms / 1000);
   if (s < 60) return `${s}s`;
-  const m = Math.floor(s/60), r = s%60;
+  const m = Math.floor(s / 60),
+    r = s % 60;
   if (m < 60) return `${m}m ${r}s`;
-  const h = Math.floor(m/60), rm=m%60;
+  const h = Math.floor(m / 60),
+    rm = m % 60;
   return `${h}h ${rm}m`;
 };
+
 const keyOf = (f: File): FileKey => `${f.name}::${f.size}::${f.lastModified}`;
 
-async function sha256(buf: ArrayBuffer){ return crypto.subtle.digest("SHA-256", buf); }
-function toBase64(buf: ArrayBuffer){
+async function sha256(buf: ArrayBuffer) {
+  return crypto.subtle.digest("SHA-256", buf);
+}
+function toBase64(buf: ArrayBuffer) {
   const bytes = new Uint8Array(buf);
   const CHUNK = 0x8000;
   let s = "";
@@ -113,19 +129,38 @@ function toBase64(buf: ArrayBuffer){
   }
   return btoa(s);
 }
-function toHex(buf: ArrayBuffer){ return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,"0")).join(""); }
+function toHex(buf: ArrayBuffer) {
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 class SpeedWindow {
-  samples: Array<[number,number]> = [];
+  samples: Array<[number, number]> = [];
   total = 0;
-  constructor(public win=10_000){}
-  push(bytes:number){ const t=Date.now(); this.samples.push([t,bytes]); this.total+=bytes; this.gc(); }
-  gc(){ const t=Date.now(); while(this.samples.length && t-this.samples[0][0]>this.win){ this.total-=this.samples[0][1]; this.samples.shift(); } }
-  bps(){ this.gc(); if (!this.samples.length) return 0; const span=Math.max(1, Date.now()-this.samples[0][0]); return (this.total*1000)/span; }
+  constructor(public win = 10_000) {}
+  push(bytes: number) {
+    const t = Date.now();
+    this.samples.push([t, bytes]);
+    this.total += bytes;
+    this.gc();
+  }
+  gc() {
+    const t = Date.now();
+    while (this.samples.length && t - this.samples[0][0] > this.win) {
+      this.total -= this.samples[0][1];
+      this.samples.shift();
+    }
+  }
+  bps() {
+    this.gc();
+    if (!this.samples.length) return 0;
+    const span = Math.max(1, Date.now() - this.samples[0][0]);
+    return (this.total * 1000) / span;
+  }
 }
 
 const baseUrl = (s: string) => s.replace(/\/$/, "");
-function buildFilesInputForBatch(batch: Batch){
+
+function buildFilesInputForBatch(batch: Batch) {
   return batch.files.map((f, idx) => ({
     index: idx,
     key: `file-${idx}`,
@@ -135,9 +170,9 @@ function buildFilesInputForBatch(batch: Batch){
 }
 
 // ---------------- API helpers ----------------
-function mergeServerHints(setter: React.Dispatch<React.SetStateAction<ServerHints>>, payload: any){
+function mergeServerHints(setter: React.Dispatch<React.SetStateAction<ServerHints>>, payload: any) {
   if (!payload || typeof payload !== "object") return;
-  setter(prev => {
+  setter((prev) => {
     const next: ServerHints = {
       partSizeMin: payload.partSizeMin ?? prev.partSizeMin,
       partSizeMax: payload.partSizeMax ?? prev.partSizeMax,
@@ -146,25 +181,25 @@ function mergeServerHints(setter: React.Dispatch<React.SetStateAction<ServerHint
       globalUploadLimit: payload.globalUploadLimit ?? prev.globalUploadLimit,
       maxBytesPerMinute: payload.maxBytesPerMinute ?? prev.maxBytesPerMinute,
       fileSizeMax: payload.fileSizeMax ?? prev.fileSizeMax,
-      // NEW
       minPartsPerFile: payload.minPartsPerFile ?? prev.minPartsPerFile,
     };
     if (Number.isFinite(payload?.min)) next.partSizeMin = payload.min;
     if (Number.isFinite(payload?.max)) next.partSizeMax = payload.max;
     if (Number.isFinite(payload?.limit)) next.maxChunksPerUpload ??= payload.limit;
     if (Number.isFinite(payload?.limitPerMinute)) next.maxBytesPerMinute = payload.limitPerMinute;
-    // alias guards
     if (Number.isFinite(payload?.minParts)) next.minPartsPerFile = payload.minParts;
     return next;
   });
 }
 
-async function fetchLimitsIfAny(base: string): Promise<Partial<ServerHints>>{
-  try{
-    const r = await fetch(`${baseUrl(base)}/limits`, { credentials:"omit", mode:"cors" });
+async function fetchLimitsIfAny(base: string): Promise<Partial<ServerHints>> {
+  try {
+    const r = await fetch(`${baseUrl(base)}/limits`, { credentials: "omit", mode: "cors" });
     if (!r.ok) return {};
     return await r.json();
-  }catch{ return {}; }
+  } catch {
+    return {};
+  }
 }
 
 async function createOrResumeBatch(
@@ -174,19 +209,27 @@ async function createOrResumeBatch(
   requestedPartSize: number,
   batch: Batch,
   resumeId: string | null,
-  onHint?: (p:any)=>void
-): Promise<ServerSession>{
-  const filesPayload = resumeId ? [{ resumeId }] : [{
-    filename: file.name,
-    contentType: file.type || "application/octet-stream",
-    totalBytes: file.size,
-    partSize: requestedPartSize,
-  }];
+  onHint?: (p: any) => void
+): Promise<ServerSession> {
+  const filesPayload = resumeId
+    ? [{ resumeId }]
+    : [
+        {
+          filename: file.name,
+          contentType: file.type || "application/octet-stream",
+          totalBytes: file.size,
+          partSize: requestedPartSize,
+        },
+      ];
 
   const body: any = {
     batchId: batch.id,
     files: filesPayload,
-    // user-provided metadata ONLY (server generates job/jobId/type internally)
+
+    // ✅ ONLY WAY to enable zip_folder logic on backend
+    type: batch.uploadType === "zip_folder" ? "zip_folder" : undefined,
+
+    // user-provided metadata ONLY
     did: (batch.did || "").trim() || undefined,
     docid: (batch.docid || "").trim() || undefined,
     doctype: (batch.doctype || "").trim() || undefined,
@@ -197,28 +240,36 @@ async function createOrResumeBatch(
 
   const r = await fetch(`${baseUrl(base)}/uploads/batch`, {
     method: "POST",
-    headers: { "Content-Type":"application/json", Authorization:`Bearer ${token.trim()}` },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token.trim()}` },
     body: JSON.stringify(body),
-    credentials: "omit", mode: "cors",
+    credentials: "omit",
+    mode: "cors",
   });
 
-  const text = await r.text().catch(()=> "");
-  let j:any = {}; try{ j = JSON.parse(text||"{}"); }catch{}
-  if (!r.ok || !j?.created?.length){
+  const text = await r.text().catch(() => "");
+  let j: any = {};
+  try {
+    j = JSON.parse(text || "{}");
+  } catch {}
+
+  if (!r.ok || !j?.created?.length) {
     onHint?.(j);
     const err: any = new Error(j?.error || `Batch create/resume failed (${r.status})`);
     (err.body = j);
     throw err;
   }
+
   const c = j.created[0];
-  return { id:c.id, wsToken:c.wsToken, partSize:c.partSize, batchId: j.batchId || c.batchId };
+  return { id: c.id, wsToken: c.wsToken, partSize: c.partSize, batchId: j.batchId || c.batchId };
 }
 
-async function getStatus(base:string, token:string, uploadId:string){
+async function getStatus(base: string, token: string, uploadId: string) {
   const r = await fetch(`${baseUrl(base)}/uploads/${uploadId}`, {
-    headers: { Authorization:`Bearer ${token.trim()}` }, credentials:"omit", mode:"cors"
+    headers: { Authorization: `Bearer ${token.trim()}` },
+    credentials: "omit",
+    mode: "cors",
   });
-  const j = await r.json().catch(()=> ({}));
+  const j = await r.json().catch(() => ({}));
   if (!r.ok) {
     const err: any = new Error(j?.error || `Status failed (${r.status})`);
     (err.body = j);
@@ -228,14 +279,28 @@ async function getStatus(base:string, token:string, uploadId:string){
 }
 
 async function getPartToken(
-  base:string, token:string, uploadId:string, pn:number, len:number, s256b64:string, onHint?:(p:any)=>void
-){
-  const r = await fetch(`${baseUrl(base)}/uploads/${uploadId}/parts/${pn}/token?len=${len}&s256=${encodeURIComponent(s256b64)}`, {
-    headers: { Authorization:`Bearer ${token.trim()}` }, credentials:"omit", mode:"cors"
-  });
-  const text = await r.text().catch(()=> "");
-  let j:any = {}; try{ j=JSON.parse(text||"{}"); }catch{}
-  if (!r.ok || !j?.token){
+  base: string,
+  token: string,
+  uploadId: string,
+  pn: number,
+  len: number,
+  s256b64: string,
+  onHint?: (p: any) => void
+) {
+  const r = await fetch(
+    `${baseUrl(base)}/uploads/${uploadId}/parts/${pn}/token?len=${len}&s256=${encodeURIComponent(s256b64)}`,
+    {
+      headers: { Authorization: `Bearer ${token.trim()}` },
+      credentials: "omit",
+      mode: "cors",
+    }
+  );
+  const text = await r.text().catch(() => "");
+  let j: any = {};
+  try {
+    j = JSON.parse(text || "{}");
+  } catch {}
+  if (!r.ok || !j?.token) {
     onHint?.(j);
     const err: any = new Error(j?.error || `Token p${pn} failed (${r.status})`);
     (err.body = j);
@@ -245,54 +310,96 @@ async function getPartToken(
 }
 
 async function putPart(
-  base:string, token:string, uploadId:string, pn:number, blob:Blob, chunkToken:string, s256b64:string, signal?:AbortSignal, onHint?:(p:any)=>void
-){
+  base: string,
+  token: string,
+  uploadId: string,
+  pn: number,
+  blob: Blob,
+  chunkToken: string,
+  s256b64: string,
+  signal?: AbortSignal,
+  onHint?: (p: any) => void
+) {
   const r = await fetch(`${baseUrl(base)}/uploads/${uploadId}/parts/${pn}`, {
-    method:"PUT",
-    headers:{
-      Authorization:`Bearer ${token.trim()}`,
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${token.trim()}`,
       "x-chunk-token": chunkToken,
       "x-checksum-sha256": s256b64,
-      "Content-Type":"application/octet-stream",
+      "Content-Type": "application/octet-stream",
     },
-    body: blob, credentials:"omit", mode:"cors", signal
+    body: blob,
+    credentials: "omit",
+    mode: "cors",
+    signal,
   });
-  if (!r.ok){
+  if (!r.ok) {
     const retryAfter = Number(r.headers.get("retry-after") || "");
-    const text = await r.text().catch(()=> "");
-    let j:any = {}; try{ j=JSON.parse(text||"{}"); }catch{}
+    const text = await r.text().catch(() => "");
+    let j: any = {};
+    try {
+      j = JSON.parse(text || "{}");
+    } catch {}
     onHint?.(j);
     const err: any = new Error(`Part ${pn} failed: ${r.status} ${j?.error || text}`);
-    (err.retryAfterMs = Number.isFinite(retryAfter) ? retryAfter*1000 : undefined);
+    (err.retryAfterMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : undefined);
     (err.body = j);
     throw err;
   }
 }
 
-async function completeUpload(base:string, token:string, uploadId:string, finalHex?:string){
+async function completeUpload(
+  base: string,
+  token: string,
+  uploadId: string,
+  finalHex?: string,
+  extra?: Record<string, any>
+) {
+  const payload = {
+    ...(finalHex ? { finalSha256Hex: finalHex } : {}),
+    ...(extra || {}),
+  };
+
   const r = await fetch(`${baseUrl(base)}/uploads/${uploadId}/complete`, {
-    method:"POST",
-    headers:{ Authorization:`Bearer ${token.trim()}`, "Content-Type":"application/json" },
-    body: JSON.stringify(finalHex ? { finalSha256Hex: finalHex } : {}),
-    credentials:"omit", mode:"cors"
+    method: "POST",
+    headers: { Authorization: `Bearer ${token.trim()}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    credentials: "omit",
+    mode: "cors",
   });
-  const j = await r.json().catch(()=> ({}));
-  if (!r.ok) {
-    const err: any = new Error(j?.error || `Complete failed (${r.status})`);
+
+  const j = await r.json().catch(() => ({} as any));
+  const hasGraphQLErrors = Array.isArray((j as any)?.errors) && (j as any).errors.length > 0;
+
+  if (!r.ok || hasGraphQLErrors) {
+    const msg = hasGraphQLErrors
+      ? String((j as any).errors[0]?.message || "Complete returned errors")
+      : String((j as any)?.error || `Complete failed (${r.status})`);
+    const err: any = new Error(msg);
     (err.body = j);
     throw err;
   }
   return j;
 }
 
-async function abortUpload(base:string, token:string, uploadId:string){
-  await fetch(`${baseUrl(base)}/uploads/${uploadId}`, { method:"DELETE", headers:{ Authorization:`Bearer ${token.trim()}` }, credentials:"omit", mode:"cors" }).catch(()=>{});
+async function abortUpload(base: string, token: string, uploadId: string) {
+  await fetch(`${baseUrl(base)}/uploads/${uploadId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token.trim()}` },
+    credentials: "omit",
+    mode: "cors",
+  }).catch(() => {});
 }
-async function heartbeat(base:string, token:string, uploadId:string){
-  await fetch(`${baseUrl(base)}/heartbeat/${uploadId}`, { method:"POST", headers:{ Authorization:`Bearer ${token.trim()}` }, credentials:"omit", mode:"cors" }).catch(()=>{});
+async function heartbeat(base: string, token: string, uploadId: string) {
+  await fetch(`${baseUrl(base)}/heartbeat/${uploadId}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token.trim()}` },
+    credentials: "omit",
+    mode: "cors",
+  }).catch(() => {});
 }
 
-// ---------- NEW: parts listing + repair helpers ----------
+// ---------- parts listing + repair helpers ----------
 async function listParts(base: string, token: string, uploadId: string) {
   const r = await fetch(`${baseUrl(base)}/uploads/${uploadId}/parts`, {
     headers: { Authorization: `Bearer ${token.trim()}` },
@@ -305,38 +412,29 @@ async function listParts(base: string, token: string, uploadId: string) {
     (err.body = j);
     throw err;
   }
-  // returns: { uploadId, parts: [{ partNumber, size, exists, cid, ipfsStatus }, ...] }
   return j;
 }
 
-// ---------- NEW: classify finalize errors ----------
+// ---------- classify finalize errors ----------
 function isBatchNotReadyError(e: any) {
   const body = e?.body || {};
-  const err  = String(body?.error || "");
+  const err = String(body?.error || "");
   const detail = String(body?.detail || "");
-  // 409 path (?requireBethelNow=1) or 5xx payloads flagging batch-not-ready
   return err === "batch_not_ready_for_bethel" || detail === "batch_not_ready";
 }
 function isBethelTransientError(e: any) {
   const body = e?.body || {};
-  // If the error object includes Bethel metadata, inspect reason and detail.
   if (body?.bethel === "failed") {
     const reason = String(body?.reason || "");
     const detail = String(body?.detail || "");
-    // If the failure is because some files are not yet completed, treat as batch-not-ready rather than transient.
-    if (reason === 'some_files_not_completed' || detail === 'batch_not_ready') {
-      return false;
-    }
+    if (reason === "some_files_not_completed" || detail === "batch_not_ready") return false;
     return (
       reason === "bethel_error" ||
       /timeout|bad gateway|network|502|503|504|fetch failed|ECONNRESET|EAI_AGAIN/i.test(detail)
     );
   }
-  // Otherwise, fall back to parsing the error message for transient 5xx conditions.
   const msg = String(e?.message || "");
-  if (/\(5\d{2}\)/.test(msg) || /bad gateway|timeout|network|fetch failed|502|503|504/i.test(msg)) {
-    return true;
-  }
+  if (/\(5\d{2}\)/.test(msg) || /bad gateway|timeout|network|fetch failed|502|503|504/i.test(msg)) return true;
   return false;
 }
 
@@ -344,7 +442,9 @@ function parseMissingPartsFromError(e: any): number[] {
   const body = e?.body || {};
   const err = body?.error || "";
   if (Array.isArray(body?.missing) && body.missing.length) {
-    return body.missing.map((x: any) => Number(x)).filter((n: number) => Number.isFinite(n) && n > 0);
+    return body.missing
+      .map((x: any) => Number(x))
+      .filter((n: number) => Number.isFinite(n) && n > 0);
   }
   const m = /^missing_part_(\d+)$/i.exec(err);
   if (m) return [Number(m[1])];
@@ -352,8 +452,14 @@ function parseMissingPartsFromError(e: any): number[] {
 }
 
 async function reuploadSpecificParts(opts: {
-  base: string; token: string; uploadId: string; file: File; partSize: number;
-  partNumbers: number[]; controller?: AbortSignal; onHint?: (p: any) => void;
+  base: string;
+  token: string;
+  uploadId: string;
+  file: File;
+  partSize: number;
+  partNumbers: number[];
+  controller?: AbortSignal;
+  onHint?: (p: any) => void;
 }) {
   const { base, token, uploadId, file, partSize, partNumbers, controller, onHint } = opts;
 
@@ -362,7 +468,8 @@ async function reuploadSpecificParts(opts: {
     const buf = await blob.arrayBuffer();
     const digest = await crypto.subtle.digest("SHA-256", buf);
     const bytes = new Uint8Array(digest);
-    let s = "", CHUNK = 0x8000;
+    let s = "",
+      CHUNK = 0x8000;
     for (let i = 0; i < bytes.length; i += CHUNK) s += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
     return { blob, b64: btoa(s), len: end - start };
   }
@@ -377,46 +484,7 @@ async function reuploadSpecificParts(opts: {
   }
 }
 
-async function repairThenComplete({
-  base, token, uploadId, file, partSize, finalHex, controller, onHint,
-}: {
-  base: string; token: string; uploadId: string; file: File; partSize: number;
-  finalHex?: string; controller?: AbortSignal; onHint?: (p: any) => void;
-}) {
-  // 1) ask the server which parts exist
-  const lp = await listParts(base, token, uploadId);
-  const expected = Math.ceil(file.size / partSize);
-  const missing: number[] = [];
-  for (let i = 1; i <= expected; i++) {
-    const row = lp.parts.find((p: any) => p.partNumber === i);
-    if (!row || !row.exists) missing.push(i);
-  }
-
-  // 2) if any are missing, re-upload them
-  if (missing.length) {
-    await reuploadSpecificParts({
-      base, token, uploadId, file, partSize, partNumbers: missing, controller, onHint,
-    });
-  }
-
-  // 3) finalize once more (with backoff) — soft accept batch-not-ready / Bethel transient
-  return await withBackoff(async () => {
-    try {
-      return await completeUpload(base, token, uploadId, finalHex);
-    } catch (e: any) {
-      if (isBatchNotReadyError(e) || isBethelTransientError(e)) {
-        return { ok: true, soft: true };
-      }
-      throw e;
-    }
-  }, 4);
-}
-
-// Simple exponential backoff with optional server-provided retryAfterMs
-async function withBackoff<T>(
-  fn: (attempt: number) => Promise<T>,
-  max = 5
-): Promise<T> {
+async function withBackoff<T>(fn: (attempt: number) => Promise<T>, max = 5): Promise<T> {
   let attempt = 0;
   let lastErr: any;
   while (attempt < max) {
@@ -435,56 +503,131 @@ async function withBackoff<T>(
   throw lastErr;
 }
 
+async function repairThenComplete({
+  base,
+  token,
+  uploadId,
+  file,
+  partSize,
+  finalHex,
+  controller,
+  onHint,
+  completeExtra,
+}: {
+  base: string;
+  token: string;
+  uploadId: string;
+  file: File;
+  partSize: number;
+  finalHex?: string;
+  controller?: AbortSignal;
+  onHint?: (p: any) => void;
+  completeExtra?: Record<string, any>;
+}) {
+  let serverPartsStatus: any = null;
+  serverPartsStatus = await listParts(base, token, uploadId);
+
+  const expected = Math.ceil(file.size / partSize);
+  const serverExistingParts = new Set(
+    (serverPartsStatus?.parts || []).filter((p: any) => p.exists).map((p: any) => p.partNumber)
+  );
+
+  const missing: number[] = [];
+  for (let i = 1; i <= expected; i++) if (!serverExistingParts.has(i)) missing.push(i);
+
+  if (missing.length) {
+    await reuploadSpecificParts({
+      base,
+      token,
+      uploadId,
+      file,
+      partSize,
+      partNumbers: missing,
+      controller,
+      onHint,
+    });
+  }
+
+  return await withBackoff(async (attempt) => {
+    try {
+      return await completeUpload(base, token, uploadId, finalHex, completeExtra);
+    } catch (e: any) {
+      if (isBatchNotReadyError(e) || isBethelTransientError(e)) {
+        return { ok: true, soft: true };
+      }
+      const stillMissing = parseMissingPartsFromError(e);
+      if (stillMissing.length) throw new Error(`Repair failed: Parts ${stillMissing.join(", ")} still missing.`);
+      throw e;
+    }
+  }, 4);
+}
 
 // ---------------- UI subcomponents ----------------
-function FieldLabel({ children, hint }:{ children:React.ReactNode; hint?:string }){
-  return <label className="fieldlbl" title={hint}>{children}</label>;
+function FieldLabel({ children, hint }: { children: React.ReactNode; hint?: string }) {
+  return (
+    <label className="fieldlbl" title={hint}>
+      {children}
+    </label>
+  );
 }
-function Section({ children }:{ children:React.ReactNode }){ return <section className="card">{children}</section>; }
-function StatusBadge({ kind, label }:{ kind:"ok"|"warn"|"err"|"idle"; label:string }){
+function Section({ children }: { children: React.ReactNode }) {
+  return <section className="card">{children}</section>;
+}
+function StatusBadge({ kind, label }: { kind: "ok" | "warn" | "err" | "idle"; label: string }) {
   return <span className={`badge ${kind}`}>{label}</span>;
 }
 
 // ---------------- Main component ----------------
-export default function UploadDashboard(){
-  const [theme,setTheme]=useState(()=> localStorage.getItem("cd-theme")==="light"?"light":"dark");
-  useEffect(()=>{ document.documentElement.dataset.theme=theme; localStorage.setItem("cd-theme", theme); },[theme]);
+export default function UploadDashboard() {
+  const [theme, setTheme] = useState(() => (localStorage.getItem("cd-theme") === "light" ? "light" : "dark"));
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("cd-theme", theme);
+  }, [theme]);
 
-  const [settings,setSettings]=useState<UploaderSettings>(()=> {
-    try{ const raw=localStorage.getItem(LS_SETTINGS); if (raw) return JSON.parse(raw); }catch{}
-    return { serverUrl:ENV_SERVER, token:ENV_TOKEN, partSizeBytes:5*1024*1024, fileConcurrency:2, finalizeChecksum:true };
+  const [settings, setSettings] = useState<UploaderSettings>(() => {
+    try {
+      const raw = localStorage.getItem(LS_SETTINGS);
+      if (raw) return JSON.parse(raw);
+    } catch {}
+    return { serverUrl: ENV_SERVER, token: ENV_TOKEN, partSizeBytes: 5 * 1024 * 1024, fileConcurrency: 2, finalizeChecksum: true };
   });
-  useEffect(()=>{ localStorage.setItem(LS_SETTINGS, JSON.stringify(settings)); },[settings]);
+  useEffect(() => {
+    localStorage.setItem(LS_SETTINGS, JSON.stringify(settings));
+  }, [settings]);
 
-  const [hints,setHints]=useState<ServerHints>({});
-  useEffect(()=>{ (async()=>{
-    if (!settings.serverUrl) return;
-    const l = await fetchLimitsIfAny(settings.serverUrl);
-    if (Object.keys(l).length) setHints(prev => ({...prev, ...l}));
-  })(); },[settings.serverUrl]);
+  const [hints, setHints] = useState<ServerHints>({});
+  useEffect(() => {
+    (async () => {
+      if (!settings.serverUrl) return;
+      const l = await fetchLimitsIfAny(settings.serverUrl);
+      if (Object.keys(l).length) setHints((prev) => ({ ...prev, ...l }));
+    })();
+  }, [settings.serverUrl]);
 
-  const [storageText,setStorageText]=useState("—");
-  useEffect(()=>{ (async()=>{
-    try{
-      // @ts-ignore
-      if (navigator?.storage?.estimate){
+  const [storageText, setStorageText] = useState("—");
+  useEffect(() => {
+    (async () => {
+      try {
         // @ts-ignore
-        const { usage=0, quota=0 } = await navigator.storage.estimate();
-        const free = Math.max(0, quota-usage);
-        setStorageText(`${fmtBytes(free)} free`);
+        if (navigator?.storage?.estimate) {
+          // @ts-ignore
+          const { usage = 0, quota = 0 } = await navigator.storage.estimate();
+          const free = Math.max(0, quota - usage);
+          setStorageText(`${fmtBytes(free)} free`);
+        }
+      } catch {
+        setStorageText("—");
       }
-    }catch{ setStorageText("—"); }
-  })(); },[]);
+    })();
+  }, []);
 
-  // Persist a mapping of file keys to their resume information.
-  // Each entry maps a FileKey (name::size::mtime) to the last known uploadId and partSize for that file.
-  // This allows us to re-use uploadIds across retries or when the user re-adds the same file.
+  // Persist mapping of file keys to resume info.
   type ResumeInfo = { uploadId: string; partSize: number };
   const readResumes = (): Record<string, ResumeInfo> => {
     try {
       const raw = localStorage.getItem(LS_RESUMES);
       if (!raw) return {};
-      // Stored format is { [fileKey]: { uploadId, partSize } }
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === "object") return parsed as Record<string, ResumeInfo>;
       return {};
@@ -492,81 +635,170 @@ export default function UploadDashboard(){
       return {};
     }
   };
-  // refs allow us to mutate the resume map without re-rendering; updates are persisted via saveResumes().
   const resumesRef = useRef<Record<string, ResumeInfo>>(readResumes());
   const saveResumes = () => localStorage.setItem(LS_RESUMES, JSON.stringify(resumesRef.current));
 
-  const [batches,setBatches] = useState<Batch[]>(()=>{
-    try{
-      const raw=localStorage.getItem(LS_BATCHES);
-      if (raw){
-        const saved = JSON.parse(raw)||[];
-        return (saved as any[]).map(b=>({
-          id: b.id, title: b.title, createdAt: b.createdAt, expanded: !!b.expanded,
+  const [batches, setBatches] = useState<Batch[]>(() => {
+    try {
+      const raw = localStorage.getItem(LS_BATCHES);
+      if (raw) {
+        const saved = JSON.parse(raw) || [];
+        return (saved as any[]).map((b) => ({
+          id: b.id,
+          title: b.title,
+          createdAt: b.createdAt,
+          expanded: !!b.expanded,
           files: [],
-          did: b.did || "", docid: b.docid || "", doctype: b.doctype || "",
-          docname: b.docname || b.dockname || "", path: b.path || "",
+          did: b.did || "",
+          docid: b.docid || "",
+          doctype: b.doctype || "",
+          docname: b.docname || b.dockname || "",
+          path: b.path || "",
+          uploadType: (b.uploadType === "zip_folder" ? "zip_folder" : "normal") as Batch["uploadType"],
         }));
       }
-    }catch{}
-    const id = makeId();
-    const initial:Batch = {
-      id, title: humanTitle(new Date()), createdAt: Date.now(), expanded:true, files:[],
-      did:"", docid:"", doctype:"", docname:"", path:""
+    } catch {}
+
+    const makeId = () => {
+      const a = new Uint8Array(8);
+      crypto.getRandomValues(a);
+      return [...a].map((b) => b.toString(16).padStart(2, "0")).join("");
     };
-    persistShells([initial]);
+
+    const humanTitle = (d = new Date()) => {
+      const pad = (n: number) => String(n).padStart(2, "0");
+      return `Batch ${pad(d.getMonth() + 1)}/${pad(d.getDate())}/${d.getFullYear()}, ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    };
+
+    const id = makeId();
+    const initial: Batch = {
+      id,
+      title: humanTitle(new Date()),
+      createdAt: Date.now(),
+      expanded: true,
+      files: [],
+      did: "",
+      docid: "",
+      doctype: "",
+      docname: "",
+      path: "",
+      uploadType: "normal",
+    };
+
+    const shells = [
+      {
+        id: initial.id,
+        title: initial.title,
+        createdAt: initial.createdAt,
+        expanded: initial.expanded,
+        did: initial.did || "",
+        docid: initial.docid || "",
+        doctype: initial.doctype || "",
+        docname: initial.docname || "",
+        path: initial.path || "",
+        uploadType: initial.uploadType,
+      },
+    ];
+    localStorage.setItem(LS_BATCHES, JSON.stringify(shells));
+
     return [initial];
   });
-  function persistShells(list:Batch[]){
-    const shells=list.map(b=>({
-      id:b.id,title:b.title,createdAt:b.createdAt,expanded:b.expanded,
-      did:b.did||"", docid:b.docid||"", doctype:b.doctype||"", docname:b.docname||"", path:b.path||"",
+
+  function persistShells(list: Batch[]) {
+    const shells = list.map((b) => ({
+      id: b.id,
+      title: b.title,
+      createdAt: b.createdAt,
+      expanded: b.expanded,
+      did: b.did || "",
+      docid: b.docid || "",
+      doctype: b.doctype || "",
+      docname: b.docname || "",
+      path: b.path || "",
+      uploadType: b.uploadType || "normal",
     }));
     localStorage.setItem(LS_BATCHES, JSON.stringify(shells));
   }
-  function humanTitle(d=new Date()){
-    const pad = (n:number)=> String(n).padStart(2,"0");
-    return `Batch ${pad(d.getMonth()+1)}/${pad(d.getDate())}/${d.getFullYear()}, ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+
+  function humanTitle(d = new Date()) {
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `Batch ${pad(d.getMonth() + 1)}/${pad(d.getDate())}/${d.getFullYear()}, ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   }
-  function makeId(){ const a=new Uint8Array(8); crypto.getRandomValues(a); return [...a].map(b=>b.toString(16).padStart(2, "0")).join(""); }
-  const addBatch = ()=> {
-    const id=makeId();
-    const b:Batch={ id, title:humanTitle(), createdAt:Date.now(), expanded:true, files:[],
-      did:"", docid:"", doctype:"", docname:"", path:""
+
+  function makeId() {
+    const a = new Uint8Array(8);
+    crypto.getRandomValues(a);
+    return [...a].map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  const addBatch = () => {
+    const id = makeId();
+    const b: Batch = {
+      id,
+      title: humanTitle(),
+      createdAt: Date.now(),
+      expanded: true,
+      files: [],
+      did: "",
+      docid: "",
+      doctype: "",
+      docname: "",
+      path: "",
+      uploadType: "normal",
     };
-    setBatches(prev=>{ const next=[b, ...prev]; persistShells(next); return next; });
+    setBatches((prev) => {
+      const next = [b, ...prev];
+      persistShells(next);
+      return next;
+    });
   };
 
   // PROGRESS + SPEED (WS + fallback)
-  const speedRefs = useRef<Map<string,SpeedWindow>>(new Map());
-  const lastServerBytes = useRef<Map<string, { t:number; b:number }>>(new Map());
-  const wsMap = useRef<Map<string,WebSocket>>(new Map());
-  const serverProgress = useRef<Map<string,{percent:number;bytesReceived:number;receivedParts:number;expectedParts:number;batchId:string}>>(new Map());
+  const speedRefs = useRef<Map<string, SpeedWindow>>(new Map());
+  const lastServerBytes = useRef<Map<string, { t: number; b: number }>>(new Map());
+  const wsMap = useRef<Map<string, WebSocket>>(new Map());
+  const serverProgress = useRef<
+    Map<string, { percent: number; bytesReceived: number; receivedParts: number; expectedParts: number; batchId: string }>
+  >(new Map());
   const lastPolledAt = useRef<Map<string, number>>(new Map());
 
-  useEffect(() => () => { wsMap.current.forEach(ws => { try { ws.close(); } catch {} }); wsMap.current.clear(); }, []);
-  useEffect(()=>{
-    const iv=setInterval(()=>{
-      batches.forEach(batch=>batch.files.forEach(f=>{
-        if (f.uploadId && (f.status==="uploading"||f.status==="paused")) heartbeat(settings.serverUrl, settings.token, f.uploadId);
-      }));
-    }, 30_000);
-    return ()=>clearInterval(iv);
-  },[batches, settings.serverUrl, settings.token]);
+  useEffect(
+    () => () => {
+      wsMap.current.forEach((ws) => {
+        try {
+          ws.close();
+        } catch {}
+      });
+      wsMap.current.clear();
+    },
+    []
+  );
 
-  function ensureWs(uploadId:string, wsToken?:string){
+  useEffect(() => {
+    const iv = setInterval(() => {
+      batches.forEach((batch) =>
+        batch.files.forEach((f) => {
+          if (f.uploadId && (f.status === "uploading" || f.status === "paused")) heartbeat(settings.serverUrl, settings.token, f.uploadId);
+        })
+      );
+    }, 30_000);
+    return () => clearInterval(iv);
+  }, [batches, settings.serverUrl, settings.token]);
+
+  function ensureWs(uploadId: string, wsToken?: string) {
     if (!wsToken || wsMap.current.has(uploadId)) return;
-    try{
-      const u=new URL(baseUrl(settings.serverUrl));
-      u.protocol=u.protocol.replace("http","ws");
-      u.pathname="/ws";
+    try {
+      const u = new URL(baseUrl(settings.serverUrl));
+      u.protocol = u.protocol.replace("http", "ws");
+      u.pathname = "/ws";
       u.searchParams.set("uploadId", uploadId);
       u.searchParams.set("wsToken", wsToken);
-      const ws=new WebSocket(u.toString());
-      ws.onmessage=(ev)=>{
-        try{
-          const m=JSON.parse(String(ev.data));
-          if (m?.type === "progress" && m.uploadId === uploadId){
+
+      const ws = new WebSocket(u.toString());
+      ws.onmessage = (ev) => {
+        try {
+          const m = JSON.parse(String(ev.data));
+          if (m?.type === "progress" && m.uploadId === uploadId) {
             const now = Date.now();
             const cur = Number(m.bytesReceived) || 0;
             serverProgress.current.set(uploadId, {
@@ -576,6 +808,7 @@ export default function UploadDashboard(){
               expectedParts: Number(m.expectedParts) || 0,
               batchId: String(m.batchId || ""),
             });
+
             const sw = speedRefs.current.get(uploadId) ?? new SpeedWindow(10_000);
             speedRefs.current.set(uploadId, sw);
             const prev = lastServerBytes.current.get(uploadId);
@@ -584,37 +817,36 @@ export default function UploadDashboard(){
               if (delta > 0) sw.push(delta);
             }
             lastServerBytes.current.set(uploadId, { t: now, b: cur });
-            setBatches(prev => prev.map(b => ({
-              ...b,
-              files: b.files.map(f => {
-                if (f.uploadId !== uploadId) return f;
-                if ((f.status === "queued" || f.status === "paused" || f.status === "error") && cur > 0 && (Number(m.percent)||0) < 100){
-                  return { ...f, status: "uploading", startedAt: f.startedAt ?? Date.now() };
-                }
-                if (f.status !== "done" && (Number(m.percent)||0) >= 100){
-                  const startedAtVal = f.startedAt ?? f.createdAt;
-                  const elapsed = Math.max(0, now - startedAtVal);
-                  const avgBps = elapsed > 0 ? (f.file.size * 1000) / elapsed : 0;
-                  return { ...f, status: "done", finalAvgBps: avgBps, totalTimeMs: elapsed, message: f.message || "Completed" };
-                }
-                return f;
-              })
-            })));
+
+            setBatches((prevBatches) =>
+              prevBatches.map((b) => ({
+                ...b,
+                files: b.files.map((f) => {
+                  if (f.uploadId !== uploadId) return f;
+                  if ((f.status === "queued" || f.status === "paused" || f.status === "error") && cur > 0 && (Number(m.percent) || 0) < 100) {
+                    return { ...f, status: "uploading", startedAt: f.startedAt ?? Date.now() };
+                  }
+                  if (f.status !== "done" && (Number(m.percent) || 0) >= 100) {
+                    const startedAtVal = f.startedAt ?? f.createdAt;
+                    const elapsed = Math.max(0, now - startedAtVal);
+                    const avgBps = elapsed > 0 ? (f.file.size * 1000) / elapsed : 0;
+                    return { ...f, status: "done", finalAvgBps: avgBps, totalTimeMs: elapsed, message: f.message || "Completed" };
+                  }
+                  return f;
+                }),
+              }))
+            );
           }
         } catch {}
       };
-      ws.onclose = () => { wsMap.current.delete(uploadId); };
+      ws.onclose = () => wsMap.current.delete(uploadId);
       ws.onerror = () => {};
       wsMap.current.set(uploadId, ws);
     } catch {}
   }
 
-  // ---------- CLEANUP ARTIFACTS (NEW) ----------
-  function cleanupUploadArtifacts(
-    uploadId?: string,
-    opts?: { keepResume?: boolean }
-  ) {
-    // Close any websocket and clear progress caches regardless of resume cleanup.
+  // ---------- CLEANUP ARTIFACTS ----------
+  function cleanupUploadArtifacts(uploadId?: string, opts?: { keepResume?: boolean }) {
     if (!uploadId) return;
     try {
       wsMap.current.get(uploadId)?.close();
@@ -624,9 +856,7 @@ export default function UploadDashboard(){
     lastServerBytes.current.delete(uploadId);
     lastPolledAt.current.delete(uploadId);
 
-    // Remove the corresponding resume entry unless instructed to keep it for a retry.
     if (!opts?.keepResume) {
-      // Find the fileKey whose resume info references this uploadId.
       const entries = Object.entries(resumesRef.current);
       for (const [fk, info] of entries) {
         if (info && info.uploadId === uploadId) {
@@ -639,33 +869,35 @@ export default function UploadDashboard(){
   }
 
   // POLLING FALLBACK (1s)
-  useEffect(()=>{
+  useEffect(() => {
     const tick = async () => {
       const now = Date.now();
-      const toPoll: Array<{uploadId:string; file: FileItem; batchId:string}> = [];
+      const toPoll: Array<{ uploadId: string; file: FileItem; batchId: string }> = [];
 
-      batches.forEach(b => b.files.forEach(f => {
-        if (!f.uploadId) return;
-        const sp = serverProgress.current.get(f.uploadId);
-        const done = sp ? sp.percent >= 100 : (f.status === 'done');
-        const hasWs = wsMap.current.has(f.uploadId);
-        if (!done && !hasWs && (f.status === 'uploading' || f.status === 'queued')){
-          const last = lastPolledAt.current.get(f.uploadId) || 0;
-          if (now - last >= 1000) {
-            lastPolledAt.current.set(f.uploadId, now);
-            toPoll.push({ uploadId: f.uploadId, file: f, batchId: b.id });
+      batches.forEach((b) =>
+        b.files.forEach((f) => {
+          if (!f.uploadId) return;
+          const sp = serverProgress.current.get(f.uploadId);
+          const done = sp ? sp.percent >= 100 : f.status === "done";
+          const hasWs = wsMap.current.has(f.uploadId);
+          if (!done && !hasWs && (f.status === "uploading" || f.status === "queued")) {
+            const last = lastPolledAt.current.get(f.uploadId) || 0;
+            if (now - last >= 1000) {
+              lastPolledAt.current.set(f.uploadId, now);
+              toPoll.push({ uploadId: f.uploadId, file: f, batchId: b.id });
+            }
           }
-        }
-      }));
+        })
+      );
 
       const MAX_P = 4;
-      for (let i = 0; i < toPoll.length && i < MAX_P; i++){
+      for (let i = 0; i < toPoll.length && i < MAX_P; i++) {
         const { uploadId, file, batchId } = toPoll[i];
-        try{
+        try {
           const st = await getStatus(settings.serverUrl, settings.token, uploadId);
-          const total = Number(st?.receivedParts?.reduce?.((a:number,b:any)=>a+b.size,0) || 0);
-          const expectedParts = Number(st?.expectedParts||0);
-          const receivedParts = Number(st?.receivedParts?.length||0);
+          const total = Number(st?.receivedParts?.reduce?.((a: number, b: any) => a + b.size, 0) || 0);
+          const expectedParts = Number(st?.expectedParts || 0);
+          const receivedParts = Number(st?.receivedParts?.length || 0);
           const percent = file.file.size > 0 ? Math.floor((total / file.file.size) * 100) : 0;
 
           serverProgress.current.set(uploadId, {
@@ -679,29 +911,31 @@ export default function UploadDashboard(){
           const sw = speedRefs.current.get(uploadId) ?? new SpeedWindow(10_000);
           speedRefs.current.set(uploadId, sw);
           const prev = lastServerBytes.current.get(uploadId);
-          if (prev){
+          if (prev) {
             const delta = Math.max(0, total - prev.b);
             if (delta > 0) sw.push(delta);
           }
           lastServerBytes.current.set(uploadId, { t: Date.now(), b: total });
 
-          setBatches(prev => prev.map(B => ({
-            ...B,
-            files: B.files.map(x => {
-              if (x.uploadId !== uploadId) return x;
-              if ((x.status === 'queued' || x.status === 'paused' || x.status === 'error') && total > 0 && percent < 100){
-                return { ...x, status: 'uploading', startedAt: x.startedAt ?? Date.now() };
-              }
-              if (x.status !== 'done' && percent >= 100){
-                const startedAtVal = x.startedAt ?? x.createdAt;
-                const elapsed = Math.max(0, Date.now() - startedAtVal);
-                const avgBps = elapsed > 0 ? (x.file.size * 1000) / elapsed : 0;
-                return { ...x, status: 'done', finalAvgBps: avgBps, totalTimeMs: elapsed, message: x.message || 'Completed' };
-              }
-              return x;
-            })
-          })));
-        }catch{}
+          setBatches((prevBatches) =>
+            prevBatches.map((B) => ({
+              ...B,
+              files: B.files.map((x) => {
+                if (x.uploadId !== uploadId) return x;
+                if ((x.status === "queued" || x.status === "paused" || x.status === "error") && total > 0 && percent < 100) {
+                  return { ...x, status: "uploading", startedAt: x.startedAt ?? Date.now() };
+                }
+                if (x.status !== "done" && percent >= 100) {
+                  const startedAtVal = x.startedAt ?? x.createdAt;
+                  const elapsed = Math.max(0, Date.now() - startedAtVal);
+                  const avgBps = elapsed > 0 ? (x.file.size * 1000) / elapsed : 0;
+                  return { ...x, status: "done", finalAvgBps: avgBps, totalTimeMs: elapsed, message: x.message || "Completed" };
+                }
+                return x;
+              }),
+            }))
+          );
+        } catch {}
       }
     };
 
@@ -709,113 +943,149 @@ export default function UploadDashboard(){
     return () => clearInterval(id);
   }, [batches, settings.serverUrl, settings.token]);
 
-  const onAddFilesToBatch = (batchId:string, incoming:File[]) => {
-    setBatches(prev=>prev.map(b=>{
-      if (b.id!==batchId) return b;
-      const next=[...b.files];
-      for (const f of incoming) {
-        const fileKey = keyOf(f);
-        if (next.some(x => x.key === fileKey)) continue;
+  const onAddFilesToBatch = (batchId: string, incoming: File[]) => {
+    setBatches((prev) =>
+      prev.map((b) => {
+        if (b.id !== batchId) return b;
 
-        // Check if we have resume information for this file. If so, prepopulate the uploadId and partSize.
-        const resumeInfo = resumesRef.current[fileKey];
-        if (resumeInfo && resumeInfo.uploadId) {
-          const { uploadId, partSize } = resumeInfo;
-          const totalParts = Math.ceil(f.size / partSize);
+        // ✅ ZIP_FOLDER mode: backend requires SINGLE zip file upload
+        // We enforce "single file in batch" to match your server rule:
+        // if (files.length !== 1) => 400 zip_folder_requires_single_zip_file
+        let addList = incoming;
+        if (b.uploadType === "zip_folder") {
+          const one = incoming[0] ? [incoming[0]] : [];
+          addList = one;
+        }
+
+        const next = [...b.files];
+
+        // zip_folder => replace existing list with just one file
+        if (b.uploadType === "zip_folder") next.splice(0, next.length);
+
+        for (const f of addList) {
+          const fileKey = keyOf(f);
+          if (next.some((x) => x.key === fileKey)) continue;
+
+          const resumeInfo = resumesRef.current[fileKey];
+          if (resumeInfo && resumeInfo.uploadId) {
+            const { uploadId, partSize } = resumeInfo;
+            const totalParts = Math.ceil(f.size / partSize);
+            next.push({
+              key: fileKey,
+              file: f,
+              status: "queued",
+              bytesSent: 0,
+              partsDone: 0,
+              partsTotal: totalParts,
+              speedBps: 0,
+              etaMs: NaN,
+              createdAt: Date.now(),
+              uploadId,
+              partSize,
+            });
+            continue;
+          }
+
+          const minParts = Number(hints.minPartsPerFile || 0);
+          let estPartSize = Math.max(1, settings.partSizeBytes);
+          if (minParts > 0) {
+            const cap = Math.max(1, Math.floor(f.size / minParts));
+            estPartSize = Math.min(estPartSize, cap);
+          }
+          const estTotal = Math.ceil(f.size / estPartSize);
+
           next.push({
             key: fileKey,
             file: f,
             status: "queued",
             bytesSent: 0,
             partsDone: 0,
-            partsTotal: totalParts,
+            partsTotal: estTotal,
             speedBps: 0,
             etaMs: NaN,
             createdAt: Date.now(),
-            uploadId,
-            partSize,
           });
-          continue;
         }
 
-        // No resume info – use estimated partSize based on hints and settings.
-        const minParts = Number(hints.minPartsPerFile || 0);
-        let estPartSize = Math.max(1, settings.partSizeBytes);
-        if (minParts > 0) {
-          const cap = Math.max(1, Math.floor(f.size / minParts)); // force >= minParts
-          estPartSize = Math.min(estPartSize, cap);
-        }
-        const estTotal = Math.ceil(f.size / estPartSize);
-
-        next.push({
-          key: fileKey,
-          file: f,
-          status: "queued",
-          bytesSent: 0,
-          partsDone: 0,
-          partsTotal: estTotal,
-          speedBps: 0,
-          etaMs: NaN,
-          createdAt: Date.now(),
-        });
-      }
-      return {...b, files:next};
-    }));
+        return { ...b, files: next };
+      })
+    );
   };
 
+  const startAll = () => batches.forEach((b) => startBatch(b.id));
 
-  const startAll = ()=> batches.forEach(b=>startBatch(b.id));
+  const startBatch = async (batchId: string) => {
+    const batch = batches.find((b) => b.id === batchId);
+    if (!batch) return;
 
-  const startBatch = async (batchId:string)=>{
-    const batch=batches.find(b=>b.id===batchId); if (!batch) return;
-    const queue=batch.files.filter(f=>["queued","paused","error"].includes(f.status)).map(f=>f.key);
+    const queue = batch.files.filter((f) => ["queued", "paused", "error"].includes(f.status)).map((f) => f.key);
     if (!queue.length) return;
 
-    setBatches(prev=>prev.map(b=>b.id!==batchId?b:{...b, files:b.files.map(it=>{
-      if (!queue.includes(it.key)) return it;
-      return {
-        ...it,
-        status:"uploading",
-        controller:new AbortController(),
-        message:"",
-        startedAt: it.startedAt ?? Date.now(),
-      };
-    })}));
+    setBatches((prev) =>
+      prev.map((b) =>
+        b.id !== batchId
+          ? b
+          : {
+              ...b,
+              files: b.files.map((it) => {
+                if (!queue.includes(it.key)) return it;
+                return { ...it, status: "uploading", controller: new AbortController(), message: "", startedAt: it.startedAt ?? Date.now() };
+              }),
+            }
+      )
+    );
 
-    const worker=async()=>{
-      while(true){
-        const nextKey=queue.shift(); if (!nextKey) break;
-        try{ await uploadOne(batchId, nextKey); }
-        catch(e:any){
-          setBatches(prev=>prev.map(b=>b.id!==batchId?b:{...b, files:b.files.map(x=>x.key===nextKey?{...x,status:(x.status==="canceled"?"canceled":"error"),message:String(e?.message||e)}:x)}));
+    const worker = async () => {
+      while (true) {
+        const nextKey = queue.shift();
+        if (!nextKey) break;
+        try {
+          await uploadOne(batchId, nextKey);
+        } catch (e: any) {
+          setBatches((prev) =>
+            prev.map((b) =>
+              b.id !== batchId
+                ? b
+                : { ...b, files: b.files.map((x) => (x.key === nextKey ? { ...x, status: x.status === "canceled" ? "canceled" : "error", message: String(e?.message || e) } : x)) }
+            )
+          );
         }
       }
     };
-    const runners=Array.from({length: Math.max(1, settings.fileConcurrency)}, ()=>worker());
+
+    const runners = Array.from({ length: Math.max(1, settings.fileConcurrency) }, () => worker());
     await Promise.allSettled(runners);
   };
 
   // Upload one file
-  const uploadOne = async (batchId:string, key:FileKey)=>{
-    const batch=batches.find(bb=>bb.id===batchId); if (!batch) return;
-    let item=batch.files.find(x=>x.key===key); if (!item) return;
+  const uploadOne = async (batchId: string, key: FileKey) => {
+    const batch = batches.find((bb) => bb.id === batchId);
+    if (!batch) return;
 
-    const sp=new SpeedWindow();
-    const update=(patch:Partial<FileItem>)=>{
-      setBatches(prev=>prev.map(B=>B.id!==batchId?B:{...B, files:B.files.map(x=>x.key===key?{...x,...patch}:x)}));
+    let item = batch.files.find((x) => x.key === key);
+    if (!item) return;
+
+    const sp = new SpeedWindow();
+    const update = (patch: Partial<FileItem>) => {
+      setBatches((prev) =>
+        prev.map((B) => (B.id !== batchId ? B : { ...B, files: B.files.map((x) => (x.key === key ? { ...x, ...patch } : x)) }))
+      );
     };
 
-    let controller=item.controller!; if (!controller){ controller=new AbortController(); update({controller}); }
+    let controller = item.controller!;
+    if (!controller) {
+      controller = new AbortController();
+      update({ controller });
+    }
 
-    let uploadId=item.uploadId ?? null;
-    let partSize=item.partSize ?? settings.partSizeBytes;
+    let uploadId = item.uploadId ?? null;
+    let partSize = item.partSize ?? settings.partSizeBytes;
+
+    const isZipFolder = batch.uploadType === "zip_folder";
+    const completeExtra = isZipFolder ? { zip: true, zipMode: true } : undefined;
 
     try {
-      // Attempt to create or resume the upload session. If the resumeId does not exist
-      // on the server, gracefully fall back to a fresh upload by clearing the
-      // resume entry and retrying.
       let sess: ServerSession | null = null;
-      let triedResume = false;
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           sess = await createOrResumeBatch(
@@ -829,83 +1099,75 @@ export default function UploadDashboard(){
           );
           break;
         } catch (err: any) {
-          // On first attempt with resumeId, if the server rejects with
-          // resume_not_found or not_found, clear the resume mapping and retry.
           const bodyErr = err?.body || {};
-          const code = bodyErr?.error || bodyErr?.detail || '';
-          if (attempt === 0 && uploadId && (code === 'resume_not_found' || code === 'not_found')) {
-            // Delete stale resume info and retry with fresh session
+          const code = bodyErr?.error || bodyErr?.detail || "";
+          if (attempt === 0 && uploadId && (code === "resume_not_found" || code === "not_found")) {
             const fileKey = keyOf(item.file);
             delete resumesRef.current[fileKey];
             saveResumes();
             uploadId = null;
             continue;
           }
-          // Otherwise rethrow
           throw err;
         }
       }
-      if (!sess) throw new Error('Unable to create upload session');
+      if (!sess) throw new Error("Unable to create upload session");
       uploadId = sess.id;
       partSize = sess.partSize;
-      // UPDATED: set partsTotal based on the server-enforced partSize
+
       update({ uploadId, partSize, partsTotal: Math.ceil(item.file.size / partSize) });
-      // Persist resume information keyed by fileKey so that retries use the same uploadId.
+
       {
         const fileKey = keyOf(item.file);
         resumesRef.current[fileKey] = { uploadId, partSize };
         saveResumes();
       }
+
       ensureWs(uploadId, sess.wsToken);
     } catch (e: any) {
-      const msg = e?.body?.detail || e?.message || 'Create/resume failed';
+      const msg = e?.body?.detail || e?.message || "Create/resume failed";
       throw new Error(msg);
     }
 
-
     const totalParts = Math.ceil(item.file.size / partSize);
     let have = new Set<number>();
-    try{
+    try {
       const st = await getStatus(settings.serverUrl, settings.token, uploadId!);
-      have = new Set((st.receivedParts||[]).map((p:any)=>Number(p.partNumber)));
-    }catch{}
+      have = new Set((st.receivedParts || []).map((p: any) => Number(p.partNumber)));
+    } catch {}
 
-    let partsDone=have.size, bytesSent=0;
+    let partsDone = have.size,
+      bytesSent = 0;
     update({ partsTotal: totalParts, partsDone, bytesSent });
 
-    const pending:number[]=[]; for(let pn=1;pn<=totalParts;pn++) if(!have.has(pn)) pending.push(pn);
-    const PART_WORKERS = Math.max(1, Math.min((hints.maxChunksPerUpload ?? 4), 8));
+    const pending: number[] = [];
+    for (let pn = 1; pn <= totalParts; pn++) if (!have.has(pn)) pending.push(pn);
 
-    async function uploadPart(pn:number){
+    const PART_WORKERS = Math.max(1, Math.min(hints.maxChunksPerUpload ?? 4, 8));
+
+    async function uploadPart(pn: number) {
       if (controller.signal.aborted) return;
       const start = (pn - 1) * partSize!;
-      const end   = Math.min(item!.file.size, start + partSize!);
-      const blob  = item!.file.slice(start, end);
-      const len   = end - start;
+      const end = Math.min(item!.file.size, start + partSize!);
+      const blob = item!.file.slice(start, end);
+      const len = end - start;
 
-      const buf     = await blob.arrayBuffer();
-      const digest  = await sha256(buf);
+      const buf = await blob.arrayBuffer();
+      const digest = await sha256(buf);
       const s256b64 = toBase64(digest);
 
-      const token = await withBackoff(
-        async () => await getPartToken(
-          settings.serverUrl, settings.token, uploadId!, pn, len, s256b64,
-          (p)=>mergeServerHints(setHints,p)
-        ),
-        5
-      );
+      const token = await withBackoff(async () => {
+        return await getPartToken(settings.serverUrl, settings.token, uploadId!, pn, len, s256b64, (p) => mergeServerHints(setHints, p));
+      }, 5);
 
       await withBackoff(async () => {
-        await putPart(
-          settings.serverUrl, settings.token, uploadId!, pn, blob, token, s256b64,
-          controller.signal, (p)=>mergeServerHints(setHints,p)
-        );
+        await putPart(settings.serverUrl, settings.token, uploadId!, pn, blob, token, s256b64, controller.signal, (p) => mergeServerHints(setHints, p));
         partsDone += 1;
         bytesSent += len;
         sp.push(len);
-        const bps    = sp.bps();
+        const bps = sp.bps();
         const remain = item!.file.size - bytesSent;
-        const eta    = bps > 0 ? (remain / bps) * 1000 : NaN;
+        const eta = bps > 0 ? (remain / bps) * 1000 : NaN;
         update({ partsDone, bytesSent, speedBps: bps, etaMs: eta });
       }, 5);
     }
@@ -917,11 +1179,11 @@ export default function UploadDashboard(){
       }
     });
 
-    try{
+    try {
       await Promise.all(workers);
 
-      if (controller.signal.aborted){
-        const paused=batches.find(bb=>bb.id===batchId)?.files.find(x=>x.key===key)?.status==="paused";
+      if (controller.signal.aborted) {
+        const paused = batches.find((bb) => bb.id === batchId)?.files.find((x) => x.key === key)?.status === "paused";
         update({ status: paused ? "paused" : "canceled" });
         return;
       }
@@ -931,14 +1193,13 @@ export default function UploadDashboard(){
 
       let finalHex: string | undefined;
       const FINALIZE_RAM_CAP = 512 * 1024 * 1024;
-      if (settings.finalizeChecksum && item.file.size <= FINALIZE_RAM_CAP){
-        const all=await item.file.arrayBuffer();
-        finalHex=toHex(await sha256(all));
+      if (settings.finalizeChecksum && item.file.size <= FINALIZE_RAM_CAP) {
+        const all = await item.file.arrayBuffer();
+        finalHex = toHex(await sha256(all));
       }
 
-      // FIRST attempt to complete, then repair on "missing_part_*" or similar
       try {
-        await completeUpload(settings.serverUrl, settings.token, uploadId!, finalHex);
+        await completeUpload(settings.serverUrl, settings.token, uploadId!, finalHex, completeExtra);
       } catch (e: any) {
         const missing = parseMissingPartsFromError(e);
         if (missing.length) {
@@ -951,9 +1212,10 @@ export default function UploadDashboard(){
             finalHex,
             controller: controller.signal,
             onHint: (p) => mergeServerHints(setHints, p),
+            completeExtra,
           });
         } else if (isBatchNotReadyError(e) || isBethelTransientError(e)) {
-          // Soft success – file is uploaded; batch will finalize later
+          // soft success
         } else {
           throw e;
         }
@@ -962,41 +1224,42 @@ export default function UploadDashboard(){
       const startedAtVal = item.startedAt ?? item.createdAt;
       const elapsed = Math.max(0, Date.now() - startedAtVal);
       const avgBps = elapsed > 0 ? (item.file.size * 1000) / elapsed : 0;
+
       update({
-        status:"done", message:"Completed", speedBps:0, etaMs:0,
-        partsDone: totalParts, bytesSent: item.file.size,
-        finalAvgBps: avgBps, totalTimeMs: elapsed
+        status: "done",
+        message: isZipFolder ? "Uploaded. ZIP_FOLDER processing queued…" : "Completed",
+        speedBps: 0,
+        etaMs: 0,
+        partsDone: totalParts,
+        bytesSent: item.file.size,
+        finalAvgBps: avgBps,
+        totalTimeMs: elapsed,
       });
 
-      // --------- CLEANUP after success (NEW) ---------
       cleanupUploadArtifacts(uploadId!);
-
-    }catch(e:any){
-      if (controller.signal.aborted){
-        const paused=batches.find(bb=>bb.id===batchId)?.files.find(x=>x.key===key)?.status==="paused";
+    } catch (e: any) {
+      if (controller.signal.aborted) {
+        const paused = batches.find((bb) => bb.id === batchId)?.files.find((x) => x.key === key)?.status === "paused";
         update({ status: paused ? "paused" : "canceled" });
-      }else{
-        // NEW: soften batch-level transient errors; treat as done
+      } else {
         if (isBatchNotReadyError(e) || isBethelTransientError(e)) {
           const startedAtVal = item.startedAt ?? item.createdAt;
           const elapsed = Math.max(0, Date.now() - startedAtVal);
           const avgBps = elapsed > 0 ? (item.file.size * 1000) / elapsed : 0;
           update({
             status: "done",
-            message: "Uploaded. Waiting for batch finalize…",
+            message: isZipFolder ? "Uploaded. ZIP_FOLDER processing pending…" : "Uploaded. Waiting for batch finalize…",
             speedBps: 0,
             etaMs: 0,
             partsDone: Math.ceil(item.file.size / partSize!),
             bytesSent: item.file.size,
             finalAvgBps: avgBps,
-            totalTimeMs: elapsed
+            totalTimeMs: elapsed,
           });
           cleanupUploadArtifacts(uploadId!);
         } else {
           const msg = e?.body?.detail || e?.message || String(e);
           update({ status: "error", message: msg });
-          // On error we keep the resume info so that a retry can re-use the existing uploadId.
-          // We still close open connections and clear progress caches.
           cleanupUploadArtifacts(uploadId!, { keepResume: true });
         }
       }
@@ -1004,90 +1267,93 @@ export default function UploadDashboard(){
   };
 
   // ---------- waitForAllParts ----------
-  async function waitForAllParts(
-    base: string,
-    token: string,
-    uploadId: string,
-    expectedParts: number,
-    timeoutMs = 180_000,
-    intervalMs = 1_500
-  ) {
+  async function waitForAllParts(base: string, token: string, uploadId: string, expectedParts: number, timeoutMs = 180_000, intervalMs = 1_500) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       let st: any = null;
+      let have = 0;
       try {
         st = await getStatus(base, token, uploadId);
+        have = Array.isArray(st?.receivedParts) ? st.receivedParts.length : 0;
       } catch (err: any) {
-        // If the server reports not_found or resume_not_found, treat as no parts yet and continue polling.
         const bodyErr = err?.body || {};
-        const code = bodyErr?.error || bodyErr?.detail || '';
-        if (code === 'not_found' || code === 'resume_not_found') {
+        const code = bodyErr?.error || bodyErr?.detail || "";
+        if (code === "not_found" || code === "resume_not_found") {
           st = null;
+          have = 0;
         } else {
-          // For other errors, rethrow to abort the wait.
           throw err;
         }
       }
-      const have = Array.isArray(st?.receivedParts) ? st.receivedParts.length : 0;
+
       if (have >= expectedParts) return st;
       await new Promise((r) => setTimeout(r, intervalMs));
     }
     throw new Error(`timeout_waiting_for_parts (expected ${expectedParts})`);
   }
 
-  async function withBackoff<T>(fn:(attempt:number)=>Promise<T>, max=5):Promise<T>{
-    let attempt=0, last:any;
-    while(attempt<max){
-      attempt++;
-      try{ return await fn(attempt); }
-      catch(e:any){
-        last=e; if (attempt>=max) break;
-        const jitter=Math.random()*200;
-        const serverBackoff=Number((e as any)?.retryAfterMs||0);
-        const backoff=serverBackoff || Math.min(30_000, 600*2**(attempt-1)) + jitter;
-        await new Promise(r=>setTimeout(r, backoff));
-      }
-    }
-    throw last;
-  }
+  const pauseFile = (batchId: string, key: FileKey) =>
+    setBatches((prev) =>
+      prev.map((B) =>
+        B.id !== batchId
+          ? B
+          : {
+              ...B,
+              files: B.files.map((x) => (x.key !== key ? x : (x.controller?.abort(), { ...x, status: "paused", message: "Paused" }))),
+            }
+      )
+    );
 
-  const pauseFile = (batchId:string, key:FileKey) =>
-    setBatches(prev=>prev.map(B=>B.id!==batchId?B:{...B, files:B.files.map(x=>x.key!==key?x:(x.controller?.abort(), {...x,status:"paused",message:"Paused"}))}));
-
-  const resumeFile = (batchId:string, key:FileKey)=>{
-    setBatches(prev=>prev.map(B=>B.id!==batchId?B:{...B, files:B.files.map(x=>x.key===key?{
-      ...x, status:"uploading", controller:new AbortController(), message:"", startedAt: x.startedAt ?? Date.now(),
-    }:x)}));
-    uploadOne(batchId,key).catch(e=> setBatches(prev=>prev.map(B=>B.id!==batchId?B:{...B, files:B.files.map(x=>x.key===key?{...x,status:"error",message:String(e)}:x)})));
+  const resumeFile = (batchId: string, key: FileKey) => {
+    setBatches((prev) =>
+      prev.map((B) =>
+        B.id !== batchId
+          ? B
+          : {
+              ...B,
+              files: B.files.map((x) => (x.key === key ? { ...x, status: "uploading", controller: new AbortController(), message: "", startedAt: x.startedAt ?? Date.now() } : x)),
+            }
+      )
+    );
+    uploadOne(batchId, key).catch((e) =>
+      setBatches((prev) =>
+        prev.map((B) => (B.id !== batchId ? B : { ...B, files: B.files.map((x) => (x.key === key ? { ...x, status: "error", message: String(e) } : x)) }))
+      )
+    );
   };
 
-  const cancelFile = async (batchId:string, key:FileKey)=>{
-    const it=batches.find(b=>b.id===batchId)?.files.find(x=>x.key===key);
+  const cancelFile = async (batchId: string, key: FileKey) => {
+    const it = batches.find((b) => b.id === batchId)?.files.find((x) => x.key === key);
     if (it?.controller) it.controller.abort();
     if (it?.uploadId) {
       await abortUpload(settings.serverUrl, settings.token, it.uploadId);
-      // --------- CLEANUP after cancel (NEW) ---------
       cleanupUploadArtifacts(it.uploadId);
     }
-    setBatches(prev=>prev.map(B=>B.id!==batchId?B:{...B, files:B.files.map(x=>x.key!==key?x:{...x,status:"canceled",message:"Canceled"})}));
+    setBatches((prev) =>
+      prev.map((B) => (B.id !== batchId ? B : { ...B, files: B.files.map((x) => (x.key !== key ? x : { ...x, status: "canceled", message: "Canceled" })) }))
+    );
   };
 
-  const removeFile = (batchId:string, key:FileKey)=>{
-    const up=batches.find(b=>b.id===batchId)?.files.find(f=>f.key===key);
-    if (up?.uploadId) cleanupUploadArtifacts(up.uploadId); // NEW
-    setBatches(prev=>prev.map(B=>B.id!==batchId?B:{...B, files:B.files.filter(x=>x.key!==key)}));
+  const removeFile = (batchId: string, key: FileKey) => {
+    const up = batches.find((b) => b.id === batchId)?.files.find((f) => f.key === key);
+    if (up?.uploadId) cleanupUploadArtifacts(up.uploadId);
+    setBatches((prev) => prev.map((B) => (B.id !== batchId ? B : { ...B, files: B.files.filter((x) => x.key !== key) })));
   };
 
-  const canStart = useMemo(()=> settings.serverUrl.trim() && settings.token.trim()
-    && batches.some(b=>b.files.some(f=>["queued","paused","error"].includes(f.status))), [batches,settings]);
+  const canStart = useMemo(
+    () => settings.serverUrl.trim() && settings.token.trim() && batches.some((b) => b.files.some((f) => ["queued", "paused", "error"].includes(f.status))),
+    [batches, settings]
+  );
 
-  const queuedCount = batches.reduce((a,b)=> a + b.files.filter(f=>f.status==="queued").length, 0);
-  const activeCount = batches.reduce((a,b)=> a + b.files.filter(f=>f.status==="uploading").length, 0);
+  const queuedCount = batches.reduce((a, b) => a + b.files.filter((f) => f.status === "queued").length, 0);
+  const activeCount = batches.reduce((a, b) => a + b.files.filter((f) => f.status === "uploading").length, 0);
 
-  // ⬇️ inlined batch meta updater (persisted) ⬇️
-  const updateBatchMeta = (batchId:string, patch: Partial<Pick<Batch, "did"|"docid"|"doctype"|"docname"|"path">>) => {
-    setBatches(prev => {
-      const next = prev.map(b => b.id !== batchId ? b : ({ ...b, ...patch }));
+  const updateBatchMeta = (
+    batchId: string,
+    patch: Partial<Pick<Batch, "did" | "docid" | "doctype" | "docname" | "path" | "uploadType">>
+  ) => {
+    setBatches((prev) => {
+      const next = prev.map((b) => (b.id !== batchId ? b : { ...b, ...patch }));
       persistShells(next);
       return next;
     });
@@ -1099,10 +1365,12 @@ export default function UploadDashboard(){
 
       <header className="topbar">
         <div className="brand">
-          <div className="logo" aria-hidden>⬆</div>
+          <div className="logo" aria-hidden>
+            ⬆
+          </div>
           <div>
             <div className="title">Chunk Uploader</div>
-            <div className="subtitle">Multi-batch • Resumable • Parallel</div>
+            <div className="subtitle">Multi-batch • Resumable • Explicit ZIP_FOLDER</div>
           </div>
         </div>
 
@@ -1119,12 +1387,16 @@ export default function UploadDashboard(){
             <span className="sep">•</span>
             <span>Storage: {storageText}</span>
           </div>
+
           <button
             className="btn ghost"
-            onClick={()=>{
-              // --------- CLEANUP for ALL (NEW) ---------
-              batches.forEach(b => b.files.forEach(f => cleanupUploadArtifacts(f.uploadId)));
-              wsMap.current.forEach(ws => { try { ws.close(); } catch {} });
+            onClick={() => {
+              batches.forEach((b) => b.files.forEach((f) => cleanupUploadArtifacts(f.uploadId)));
+              wsMap.current.forEach((ws) => {
+                try {
+                  ws.close();
+                } catch {}
+              });
               wsMap.current.clear();
               setBatches([]);
               persistShells([]);
@@ -1133,8 +1405,14 @@ export default function UploadDashboard(){
           >
             Clear All
           </button>
-          <button className="btn" disabled={!canStart} onClick={startAll}>Start All</button>
-          <button className="btn ghost toggle" onClick={()=>setTheme(t=>t==="dark"?"light":"dark")}>{theme==="dark"?"☼":"☾"}</button>
+
+          <button className="btn" disabled={!canStart} onClick={startAll}>
+            Start All
+          </button>
+
+          <button className="btn ghost toggle" onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}>
+            {theme === "dark" ? "☼" : "☾"}
+          </button>
         </div>
       </header>
 
@@ -1142,11 +1420,11 @@ export default function UploadDashboard(){
         <div className="grid2">
           <div>
             <FieldLabel hint="Your upload service base URL">Server URL</FieldLabel>
-            <input type="text" value={settings.serverUrl} onChange={e=>setSettings(s=>({...s, serverUrl:e.target.value}))} placeholder={ENV_SERVER} spellCheck={false}/>
+            <input type="text" value={settings.serverUrl} onChange={(e) => setSettings((s) => ({ ...s, serverUrl: e.target.value }))} placeholder={ENV_SERVER} spellCheck={false} />
           </div>
           <div>
             <FieldLabel hint="Bearer token for authentication">Bearer Token</FieldLabel>
-            <input type="text" value={settings.token} onChange={e=>setSettings(s=>({...s, token:e.target.value}))} placeholder={ENV_TOKEN||"paste JWT"} spellCheck={false}/>
+            <input type="text" value={settings.token} onChange={(e) => setSettings((s) => ({ ...s, token: e.target.value }))} placeholder={ENV_TOKEN || "paste JWT"} spellCheck={false} />
           </div>
         </div>
 
@@ -1156,26 +1434,31 @@ export default function UploadDashboard(){
             <div>
               <FieldLabel hint="Size of each chunk in bytes">Part size (bytes)</FieldLabel>
               <input
-                type="number" min={1024*1024} step={1024*1024}
+                type="number"
+                min={1024 * 1024}
+                step={1024 * 1024}
                 value={settings.partSizeBytes}
-                onChange={e=>setSettings(s=>({...s, partSizeBytes: Math.max(1024*1024, parseInt(e.target.value||"0",10))}))}
+                onChange={(e) => setSettings((s) => ({ ...s, partSizeBytes: Math.max(1024 * 1024, parseInt(e.target.value || "0", 10)) }))}
               />
               <div className="hint">Usually 5–50 MiB; server min/max apply</div>
             </div>
             <div>
               <FieldLabel hint="How many files upload at once (across batches)">Parallel files</FieldLabel>
               <input
-                type="number" min={1} max={8}
+                type="number"
+                min={1}
+                max={8}
                 value={settings.fileConcurrency}
-                onChange={e=>setSettings(s=>({...s, fileConcurrency: Math.min(8, Math.max(1, parseInt(e.target.value||"1",10))) }))}
+                onChange={(e) => setSettings((s) => ({ ...s, fileConcurrency: Math.min(8, Math.max(1, parseInt(e.target.value || "1", 10))) }))}
               />
             </div>
             <div className="checkbox">
               <FieldLabel hint="Send final file checksum to server when complete">Finalize with SHA-256</FieldLabel>
               <div className="row">
-                <input id="finalize" type="checkbox" checked={settings.finalizeChecksum}
-                       onChange={e=>setSettings(s=>({...s, finalizeChecksum:e.target.checked }))}/>
-                <label htmlFor="finalize" className="hint">Send final file checksum to server on complete (browser will skip huge files)</label>
+                <input id="finalize" type="checkbox" checked={settings.finalizeChecksum} onChange={(e) => setSettings((s) => ({ ...s, finalizeChecksum: e.target.checked }))} />
+                <label htmlFor="finalize" className="hint">
+                  Send final file checksum to server on complete (browser will skip huge files)
+                </label>
               </div>
             </div>
           </div>
@@ -1184,32 +1467,57 @@ export default function UploadDashboard(){
           {batches[0] && (
             <div className="limits" style={{ marginTop: 14 }}>
               <div className="limits-title">Batch metadata</div>
+
               <div className="grid3">
                 <div>
-                  <FieldLabel hint="Decentralized Identifier for ownership context">DID</FieldLabel>
-                  <input type="text" value={batches[0]?.did||""} onChange={e=>updateBatchMeta(batches[0].id,{did:e.target.value})} placeholder="did:bethel:main:8788c111-..." />
+                  <FieldLabel hint="✅ This controls backend: isZipFolder = (type === 'zip_folder')">Upload Type</FieldLabel>
+                  <select
+                    value={batches[0].uploadType}
+                    onChange={(e) => updateBatchMeta(batches[0].id, { uploadType: e.target.value as Batch["uploadType"] })}
+                  >
+                    <option value="normal">normal</option>
+                    <option value="zip_folder">zip_folder</option>
+                  </select>
+                  <div className="hint">
+                    Backend ZIP_FOLDER mode is enabled <b>only</b> when client sends <code>type: "zip_folder"</code>.
+                  </div>
                 </div>
+
+                <div>
+                  <FieldLabel hint="Decentralized Identifier for ownership context">DID</FieldLabel>
+                  <input type="text" value={batches[0]?.did || ""} onChange={(e) => updateBatchMeta(batches[0].id, { did: e.target.value })} placeholder="did:bethel:main:..." />
+                </div>
+
                 <div>
                   <FieldLabel hint="Document ID">Doc ID</FieldLabel>
-                  <input type="text" value={batches[0]?.docid||""} onChange={e=>updateBatchMeta(batches[0].id,{docid:e.target.value})} placeholder="DOC-123" />
-                </div>
-                <div>
-                  <FieldLabel hint="Classification or type of the document">Doc Type</FieldLabel>
-                  <input type="text" value={batches[0]?.doctype||""} onChange={e=>updateBatchMeta(batches[0].id,{doctype:e.target.value})} placeholder="invoice, video, ..." />
+                  <input type="text" value={batches[0]?.docid || ""} onChange={(e) => updateBatchMeta(batches[0].id, { docid: e.target.value })} placeholder="DOC-123" />
                 </div>
               </div>
-              <div className="grid3" style={{marginTop:8}}>
+
+              <div className="grid3" style={{ marginTop: 8 }}>
+                <div>
+                  <FieldLabel hint="Classification or type of the document">Doc Type</FieldLabel>
+                  <input type="text" value={batches[0]?.doctype || ""} onChange={(e) => updateBatchMeta(batches[0].id, { doctype: e.target.value })} placeholder="invoice, video, ..." />
+                </div>
+
                 <div>
                   <FieldLabel hint="Human-friendly document name">Doc Name</FieldLabel>
-                  <input type="text" value={batches[0]?.docname||""} onChange={e=>updateBatchMeta(batches[0].id,{docname:e.target.value})} placeholder="Q3 Billing"/>
+                  <input type="text" value={batches[0]?.docname || ""} onChange={(e) => updateBatchMeta(batches[0].id, { docname: e.target.value })} placeholder="Q3 Billing" />
                 </div>
+
                 <div>
                   <FieldLabel hint="Virtual path / folder for the batch">Path</FieldLabel>
-                  <input type="text" value={batches[0]?.path||""} onChange={e=>updateBatchMeta(batches[0].id,{path:e.target.value})} placeholder="/org/acme/2025/q3"/>
+                  <input type="text" value={batches[0]?.path || ""} onChange={(e) => updateBatchMeta(batches[0].id, { path: e.target.value })} placeholder="/org/acme/2025/q3" />
                 </div>
+              </div>
+
+              <div className="grid3" style={{ marginTop: 8 }}>
                 <div>
                   <FieldLabel hint="Files descriptor sent for hashing (auto)">Files Input</FieldLabel>
-                  <input type="text" value={`${batches[0]?.files.length ?? 0} file(s)`} readOnly/>
+                  <input type="text" value={`${batches[0]?.files.length ?? 0} file(s)`} readOnly />
+                </div>
+                <div className="hint" style={{ gridColumn: "span 2" }}>
+                  If you select <code>zip_folder</code>, UI will allow only <b>one</b> file in the batch (matching server rule).
                 </div>
               </div>
             </div>
@@ -1231,127 +1539,228 @@ export default function UploadDashboard(){
               </button>
             </div>
             <div className="limits-grid">
-              <div><span>Part size min</span><b>{hints.partSizeMin ? fmtBytes(hints.partSizeMin) : "—"}</b></div>
-              <div><span>Part size max</span><b>{hints.partSizeMax ? fmtBytes(hints.partSizeMax) : "—"}</b></div>
-              <div><span>Max chunks/upload</span><b>{hints.maxChunksPerUpload ?? "—"}</b></div>
-              <div><span>Max files/user</span><b>{hints.maxConcurrentFiles ?? "—"}</b></div>
-              <div><span>Global chunk limit</span><b>{hints.globalUploadLimit ?? "—"}</b></div>
-              <div><span>Per-minute user cap</span><b>{hints.maxBytesPerMinute ? fmtBytes(hints.maxBytesPerMinute) : "—"}</b></div>
-              <div><span>Max file size</span><b>{hints.fileSizeMax ? fmtBytes(hints.fileSizeMax) : "—"}</b></div>
-              {/* NEW */}
-              <div><span>Min parts / file</span><b>{hints.minPartsPerFile ?? "—"}</b></div>
+              <div>
+                <span>Part size min</span>
+                <b>{hints.partSizeMin ? fmtBytes(hints.partSizeMin) : "—"}</b>
+              </div>
+              <div>
+                <span>Part size max</span>
+                <b>{hints.partSizeMax ? fmtBytes(hints.partSizeMax) : "—"}</b>
+              </div>
+              <div>
+                <span>Max chunks/upload</span>
+                <b>{hints.maxChunksPerUpload ?? "—"}</b>
+              </div>
+              <div>
+                <span>Max files/user</span>
+                <b>{hints.maxConcurrentFiles ?? "—"}</b>
+              </div>
+              <div>
+                <span>Global chunk limit</span>
+                <b>{hints.globalUploadLimit ?? "—"}</b>
+              </div>
+              <div>
+                <span>Per-minute user cap</span>
+                <b>{hints.maxBytesPerMinute ? fmtBytes(hints.maxBytesPerMinute) : "—"}</b>
+              </div>
+              <div>
+                <span>Max file size</span>
+                <b>{hints.fileSizeMax ? fmtBytes(hints.fileSizeMax) : "—"}</b>
+              </div>
+              <div>
+                <span>Min parts / file</span>
+                <b>{hints.minPartsPerFile ?? "—"}</b>
+              </div>
             </div>
-            <div className="hint">Auto-fills from <code>/limits</code> if present; otherwise learns from error payloads.</div>
+            <div className="hint">
+              Auto-fills from <code>/limits</code> if present; otherwise learns from error payloads.
+            </div>
           </div>
         </details>
       </Section>
 
       <div className="batchbar">
-        <button className="btn" onClick={addBatch}>+ New Batch</button>
+        <button className="btn" onClick={addBatch}>
+          + New Batch
+        </button>
       </div>
 
-      {batches.length===0 && <Section><div className="empty">No batches — click <b>New Batch</b> to begin.</div></Section>}
+      {batches.length === 0 && (
+        <Section>
+          <div className="empty">
+            No batches — click <b>New Batch</b> to begin.
+          </div>
+        </Section>
+      )}
 
-      {batches.map(batch=>{
-        const totalBytes = batch.files.reduce((a,f)=>a+f.file.size,0);
-        const uploaded = batch.files.reduce((a,f)=>{
+      {batches.map((batch) => {
+        const totalBytes = batch.files.reduce((a, f) => a + f.file.size, 0);
+        const uploaded = batch.files.reduce((a, f) => {
           const sv = f.uploadId ? serverProgress.current.get(f.uploadId) : undefined;
           const server = sv?.bytesReceived ?? 0;
           const client = f.bytesSent ?? 0;
           return a + Math.max(server, client);
-        },0);
-        const pct = totalBytes>0 ? Math.floor((uploaded/totalBytes)*100) : 0;
-        const queued = batch.files.filter(f=>f.status==="queued").length;
-        const active = batch.files.filter(f=>f.status==="uploading").length;
+        }, 0);
+        const pct = totalBytes > 0 ? Math.floor((uploaded / totalBytes) * 100) : 0;
+        const queued = batch.files.filter((f) => f.status === "queued").length;
+        const active = batch.files.filter((f) => f.status === "uploading").length;
 
         return (
           <Section key={batch.id}>
             <div className="batchhead">
-              <button className="fold" onClick={()=>{
-                setBatches(prev=>{ const next=prev.map(b=>b.id===batch.id?{...b,expanded:!b.expanded}:b); persistShells(next); return next; });
-              }}>{batch.expanded?"▾":"▸"}</button>
+              <button
+                className="fold"
+                onClick={() => {
+                  setBatches((prev) => {
+                    const next = prev.map((b) => (b.id === batch.id ? { ...b, expanded: !b.expanded } : b));
+                    persistShells(next);
+                    return next;
+                  });
+                }}
+              >
+                {batch.expanded ? "▾" : "▸"}
+              </button>
               <div className="bmeta">
-                <div className="btitle">{batch.title}</div>
-                <div className="bsub"><span>{queued} queued</span><span className="sep">•</span><span>{active} active</span><span className="sep">•</span><span>{fmtBytes(uploaded)} / {fmtBytes(totalBytes)}</span></div>
+                <div className="btitle">
+                  {batch.title}{" "}
+                  <span className="chip" style={{ marginLeft: 8 }}>
+                    {batch.uploadType}
+                  </span>
+                </div>
+                <div className="bsub">
+                  <span>{queued} queued</span>
+                  <span className="sep">•</span>
+                  <span>{active} active</span>
+                  <span className="sep">•</span>
+                  <span>
+                    {fmtBytes(uploaded)} / {fmtBytes(totalBytes)}
+                  </span>
+                </div>
               </div>
               <div className="bactions">
                 <button
                   className="btn ghost"
-                  onClick={()=>{
-                    // --------- CLEANUP when clearing a batch (NEW) ---------
-                    batch.files.forEach(f => cleanupUploadArtifacts(f.uploadId));
-                    setBatches(prev=>prev.map(b=>b.id!==batch.id?b:{...b, files:[]}));
+                  onClick={() => {
+                    batch.files.forEach((f) => cleanupUploadArtifacts(f.uploadId));
+                    setBatches((prev) => prev.map((b) => (b.id !== batch.id ? b : { ...b, files: [] })));
                   }}
                 >
                   Clear Batch
                 </button>
-                <button className="btn" disabled={!batch.files.some(f=>["queued","paused","error"].includes(f.status)) || !settings.token || !settings.serverUrl} onClick={()=>startBatch(batch.id)}>Start Batch</button>
+                <button
+                  className="btn"
+                  disabled={!batch.files.some((f) => ["queued", "paused", "error"].includes(f.status)) || !settings.token || !settings.serverUrl}
+                  onClick={() => startBatch(batch.id)}
+                >
+                  Start Batch
+                </button>
               </div>
             </div>
 
             <div className="progressrow batchbarrow">
-              <progress value={pct} max={100}/><span className="pct">{pct}%</span>
-              <button className="btn ghost sm" onClick={()=>{
-                batch.files.forEach(async f=>{
-                  if (!f.uploadId) return;
-                  try{
-                    const st=await getStatus(settings.serverUrl, settings.token, f.uploadId);
-                    const total=Number(st?.receivedParts?.reduce?.((a:number,b:any)=>a+b.size,0) || 0);
-                    serverProgress.current.set(f.uploadId,{
-                      percent: Math.floor((total/f.file.size)*100) || 0,
-                      bytesReceived: total,
-                      receivedParts: Number(st?.receivedParts?.length||0),
-                      expectedParts: Number(st?.expectedParts||0),
-                      batchId: String(st?.batchId||batch.id),
-                    });
-                    const sw = speedRefs.current.get(f.uploadId) ?? new SpeedWindow(10_000);
-                    speedRefs.current.set(f.uploadId, sw);
-                    const prev = lastServerBytes.current.get(f.uploadId);
-                    if (prev){ const delta = Math.max(0, total - prev.b); if (delta>0) sw.push(delta); }
-                    lastServerBytes.current.set(f.uploadId, { t: Date.now(), b: total });
-                    setBatches(prev=>[...prev]);
-                  }catch{}
-                });
-              }}>Refresh Files</button>
+              <progress value={pct} max={100} />
+              <span className="pct">{pct}%</span>
+              <button
+                className="btn ghost sm"
+                onClick={() => {
+                  batch.files.forEach(async (f) => {
+                    if (!f.uploadId) return;
+                    try {
+                      const st = await getStatus(settings.serverUrl, settings.token, f.uploadId);
+                      const total = Number(st?.receivedParts?.reduce?.((a: number, b: any) => a + b.size, 0) || 0);
+                      serverProgress.current.set(f.uploadId, {
+                        percent: Math.floor((total / f.file.size) * 100) || 0,
+                        bytesReceived: total,
+                        receivedParts: Number(st?.receivedParts?.length || 0),
+                        expectedParts: Number(st?.expectedParts || 0),
+                        batchId: String(st?.batchId || batch.id),
+                      });
+                      const sw = speedRefs.current.get(f.uploadId) ?? new SpeedWindow(10_000);
+                      speedRefs.current.set(f.uploadId, sw);
+                      const prev = lastServerBytes.current.get(f.uploadId);
+                      if (prev) {
+                        const delta = Math.max(0, total - prev.b);
+                        if (delta > 0) sw.push(delta);
+                      }
+                      lastServerBytes.current.set(f.uploadId, { t: Date.now(), b: total });
+                      setBatches((prev) => [...prev]);
+                    } catch {}
+                  });
+                }}
+              >
+                Refresh Files
+              </button>
             </div>
 
             {batch.expanded && (
               <>
-                <div className="droparea"
-                     onDragOver={e=>{e.preventDefault(); e.currentTarget.classList.add("dragging");}}
-                     onDragLeave={e=>{e.currentTarget.classList.remove("dragging");}}
-                     onDrop={e=>{
-                       e.preventDefault();
-                       e.currentTarget.classList.remove("dragging");
-                       const fl=Array.from(e.dataTransfer?.files||[]);
-                       if (fl.length) onAddFilesToBatch(batch.id, fl);
-                     }}>
+                <div
+                  className="droparea"
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    e.currentTarget.classList.add("dragging");
+                  }}
+                  onDragLeave={(e) => {
+                    e.currentTarget.classList.remove("dragging");
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    e.currentTarget.classList.remove("dragging");
+                    const fl = Array.from(e.dataTransfer?.files || []);
+                    if (fl.length) onAddFilesToBatch(batch.id, fl);
+                  }}
+                >
                   <div className="dropinner">
                     <div className="dropicon">📁</div>
                     <div className="droptitle">Drop files here</div>
                     <div className="hint">Batch: {batch.title}</div>
+                    <div className="hint">Type: {batch.uploadType}</div>
                     <div className="hint">or</div>
-                    <label className="btn filebtn">Choose Files
-                      <input type="file" multiple style={{display:"none"}} onChange={e=>{const fl=Array.from(e.target.files||[]); if(fl.length) onAddFilesToBatch(batch.id, fl); e.currentTarget.value="";}}/>
+                    <label className="btn filebtn">
+                      Choose Files
+                      <input
+                        type="file"
+                        multiple={batch.uploadType !== "zip_folder"}
+                        style={{ display: "none" }}
+                        onChange={(e) => {
+                          const fl = Array.from(e.target.files || []);
+                          if (fl.length) onAddFilesToBatch(batch.id, fl);
+                          e.currentTarget.value = "";
+                        }}
+                      />
                     </label>
+                    {batch.uploadType === "zip_folder" && (
+                      <div className="hint" style={{ marginTop: 6 }}>
+                        ZIP_FOLDER mode: this batch will contain <b>only one</b> file.
+                      </div>
+                    )}
                   </div>
                 </div>
 
                 <div className="table">
-                  <div className="thead"><div>File</div><div className="right">Size</div><div style={{width:520}}>Progress</div><div className="right">Speed</div><div className="right">ETA</div><div className="right">Actions</div></div>
-                  {batch.files.length===0 && <div className="empty">No files yet — add some above.</div>}
-                  {batch.files.map(fi=>{
+                  <div className="thead">
+                    <div>File</div>
+                    <div className="right">Size</div>
+                    <div style={{ width: 520 }}>Progress</div>
+                    <div className="right">Speed</div>
+                    <div className="right">ETA</div>
+                    <div className="right">Actions</div>
+                  </div>
+
+                  {batch.files.length === 0 && <div className="empty">No files yet — add some above.</div>}
+
+                  {batch.files.map((fi) => {
                     const sv = fi.uploadId ? serverProgress.current.get(fi.uploadId) : undefined;
                     const serverPct = sv?.percent ?? 0;
-                    const clientPct = fi.partsTotal ? Math.floor((fi.partsDone/fi.partsTotal)*100) : 0;
+                    const clientPct = fi.partsTotal ? Math.floor((fi.partsDone / fi.partsTotal) * 100) : 0;
                     const displayPct = Math.max(Number.isFinite(serverPct) ? serverPct : 0, clientPct);
                     const partsText = sv
-                      ? `${Math.max(sv.receivedParts||0, fi.partsDone||0)}/${sv.expectedParts||fi.partsTotal} parts`
+                      ? `${Math.max(sv.receivedParts || 0, fi.partsDone || 0)}/${sv.expectedParts || fi.partsTotal} parts`
                       : `${fi.partsDone}/${fi.partsTotal} parts`;
 
                     const serverBytes = sv?.bytesReceived ?? 0;
-                    const bytesDone   = Math.max(serverBytes, fi.bytesSent);
-                    const bytesText   = `${fmtBytes(bytesDone)} / ${fmtBytes(fi.file.size)}`;
+                    const bytesDone = Math.max(serverBytes, fi.bytesSent);
+                    const bytesText = `${fmtBytes(bytesDone)} / ${fmtBytes(fi.file.size)}`;
 
                     const wsSw = fi.uploadId ? speedRefs.current.get(fi.uploadId) : undefined;
                     const wsBps = wsSw?.bps() || 0;
@@ -1368,30 +1777,66 @@ export default function UploadDashboard(){
                       }
                     } else {
                       const bpsToShow = fi.finalAvgBps && fi.finalAvgBps > 0 ? fi.finalAvgBps : currBps;
-                      speedCell = bpsToShow > 0 ? `${fmtBytes(bpsToShow)}/s` : '—';
-                      etaCell = fi.totalTimeMs && fi.totalTimeMs > 0 ? fmtTime(fi.totalTimeMs) : '—';
+                      speedCell = bpsToShow > 0 ? `${fmtBytes(bpsToShow)}/s` : "—";
+                      etaCell = fi.totalTimeMs && fi.totalTimeMs > 0 ? fmtTime(fi.totalTimeMs) : "—";
                     }
 
                     return (
                       <div key={fi.key} className="trow">
                         <div className="filecell">
-                          <div className="filename" title={fi.file.name}>{fi.file.name}</div>
+                          <div className="filename" title={fi.file.name}>
+                            {fi.file.name}
+                          </div>
                           <div className="muted small">{fi.uploadId ? `ID: ${fi.uploadId}` : "—"}</div>
-                          <div className="badges"><span className={`chip ${fi.status}`}>{fi.status}</span></div>
+                          <div className="badges">
+                            <span className={`chip ${fi.status}`}>{fi.status}</span>
+                            {batch.uploadType === "zip_folder" && <span className="chip">ZIP_FOLDER</span>}
+                          </div>
                         </div>
                         <div className="right">{fmtBytes(fi.file.size)}</div>
                         <div>
-                          <div className="progressrow"><progress value={displayPct} max={100}/><span className="pct">{Math.floor(displayPct)}%</span></div>
-                          <div className="muted small">{partsText} • {bytesText}</div>
-                          {fi.message && <div className={`small ${fi.status==="error"?"err":"muted"}`}>{fi.message}</div>}
+                          <div className="progressrow">
+                            <progress value={displayPct} max={100} />
+                            <span className="pct">{Math.floor(displayPct)}%</span>
+                          </div>
+                          <div className="muted small">
+                            {partsText} • {bytesText}
+                          </div>
+                          {fi.message && <div className={`small ${fi.status === "error" ? "err" : "muted"}`}>{fi.message}</div>}
                         </div>
                         <div className="right">{speedCell}</div>
                         <div className="right">{etaCell}</div>
                         <div className="right actions">
-                          {fi.status==="queued" && <button className="btn ghost" onClick={()=>resumeFile(batch.id, fi.key)}>Start</button>}
-                          {fi.status==="uploading" && (<><button className="btn ghost" onClick={()=>pauseFile(batch.id, fi.key)}>Pause</button><button className="btn ghost warn" onClick={()=>cancelFile(batch.id, fi.key)}>Cancel</button></>)}
-                          {fi.status==="paused" && (<><button className="btn ghost" onClick={()=>resumeFile(batch.id, fi.key)}>Resume</button><button className="btn ghost warn" onClick={()=>cancelFile(batch.id, fi.key)}>Cancel</button></>)}
-                          {["error","canceled","done"].includes(fi.status) && <button className="btn ghost" onClick={()=>removeFile(batch.id, fi.key)}>Remove</button>}
+                          {fi.status === "queued" && (
+                            <button className="btn ghost" onClick={() => resumeFile(batch.id, fi.key)}>
+                              Start
+                            </button>
+                          )}
+                          {fi.status === "uploading" && (
+                            <>
+                              <button className="btn ghost" onClick={() => pauseFile(batch.id, fi.key)}>
+                                Pause
+                              </button>
+                              <button className="btn ghost warn" onClick={() => cancelFile(batch.id, fi.key)}>
+                                Cancel
+                              </button>
+                            </>
+                          )}
+                          {fi.status === "paused" && (
+                            <>
+                              <button className="btn ghost" onClick={() => resumeFile(batch.id, fi.key)}>
+                                Resume
+                              </button>
+                              <button className="btn ghost warn" onClick={() => cancelFile(batch.id, fi.key)}>
+                                Cancel
+                              </button>
+                            </>
+                          )}
+                          {["error", "canceled", "done"].includes(fi.status) && (
+                            <button className="btn ghost" onClick={() => removeFile(batch.id, fi.key)}>
+                              Remove
+                            </button>
+                          )}
                         </div>
                       </div>
                     );
@@ -1421,8 +1866,19 @@ const css = `
 .sysstatus .dot{color:var(--ok)} .sysstatus .sep{opacity:.7}
 .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;box-shadow:0 8px 22px rgba(0,0,0,.18);margin-bottom:12px}
 .fieldlbl{display:block;color:var(--muted);font-size:12px;margin-bottom:6px;font-weight:600}
-input[type=text],input[type=number]{width:100%;padding:11px 12px;border-radius:12px;border:1px solid var(--line);background:color-mix(in oklab,var(--card) 94%, black 6%);color:var(--fg);outline:none}
-input[type=text]:focus,input[type=number]:focus{border-color:color-mix(in oklab,var(--brand) 70%, white 30%);box-shadow:0 0 0 3px color-mix(in oklab,var(--brand) 25%, transparent)}
+input[type=text],input[type=number],select{
+  width:100%;
+  padding:11px 12px;
+  border-radius:12px;
+  border:1px solid var(--line);
+  background:color-mix(in oklab,var(--card) 94%, black 6%);
+  color:var(--fg);
+  outline:none
+}
+input[type=text]:focus,input[type=number]:focus,select:focus{
+  border-color:color-mix(in oklab,var(--brand) 70%, white 30%);
+  box-shadow:0 0 0 3px color-mix(in oklab,var(--brand) 25%, transparent)
+}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 .checkbox .row{display:flex;gap:8px;align-items:center}
@@ -1443,7 +1899,7 @@ input[type=text]:focus,input[type=number]:focus{border-color:color-mix(in oklab,
 .filebtn{margin-top:6px;display:inline-block}
 .badge{padding:6px 8px;border-radius:999px;border:1px solid var(--line);font-size:12px;color:var(--muted);background:color-mix(in oklab,var(--card) 92%, black 8%)}
 .badge.ok{color:var(--ok)} .badge.warn{color:var(--warn)} .badge.err{color:var(--err)}
-.chip{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--chip);color:var(--chipText);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+.chip{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--chip);color:var(--chipText);font-size:11px;text-transform:uppercase;letter-spacing:.06em;margin-right:6px}
 .chip.uploading{background:color-mix(in oklab,var(--brand) 25%, var(--chip))}
 .chip.done{background:color-mix(in oklab,var(--ok) 40%, var(--chip))}
 .chip.error{background:color-mix(in oklab,var(--err) 40%, var(--chip))}
